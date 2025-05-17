@@ -141,6 +141,34 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kDynamicMaskBufferPerQuery = kMaxKeysPerBlock * (2 * sizeof(float) + sizeof(int));
     static constexpr int kTotalDynamicMaskBuffer = kBlockM * kDynamicMaskBufferPerQuery;
 
+    // Dynamic mask shared memory layouts
+    using SmemLayoutDynamicMaskValues = decltype(
+        tile_to_shape(
+            composition(Swizzle<kSwizzle, 3, 3>{},
+                        Layout<Shape<_8, Int<kBlockKSmem>>,
+                               Stride<Int<kBlockKSmem>, _1>>{}),
+            Shape<Int<kBlockM>, Int<kBlockN>>{}
+        )
+    );
+
+    using SmemLayoutDynamicMaskSortKeys = decltype(
+        tile_to_shape(
+            composition(Swizzle<kSwizzle, 3, 3>{},
+                        Layout<Shape<_8, Int<kBlockKSmem>>,
+                               Stride<Int<kBlockKSmem>, _1>>{}),
+            Shape<Int<kBlockM>, Int<kBlockN>>{}
+        )
+    );
+
+    using SmemLayoutDynamicMaskSortIndices = decltype(
+        tile_to_shape(
+            composition(Swizzle<kSwizzle, 3, 3>{},
+                        Layout<Shape<_8, Int<kBlockKSmem>>,
+                               Stride<Int<kBlockKSmem>, _1>>{}),
+            Shape<Int<kBlockM>, Int<kBlockN>>{}
+        )
+    );
+
     // Shared memory size calculations
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
