@@ -30,9 +30,9 @@ namespace FLASH_NAMESPACE {
 template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
 
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Return_softmax) {
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Return_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
-        FLASH_NAMESPACE::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, Return_softmax>(params);
+        FLASH_NAMESPACE::compute_attn<Kernel_traits, Is_causal, Is_even_MN, Is_even_K, Return_softmax>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -51,7 +51,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
     FLASH_NAMESPACE::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+template<typename Kernel_traits, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     const size_t smem_size = Kernel_traits::kSmemSizeWithMask;
     // printf("smem_size = %d\n", smem_size);
@@ -69,20 +69,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
-                SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                    
-                    // Will only return softmax if dropout, to reduce compilation time.
-                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                    // If return_softmax, set IsEvenMNConst to false to reduce number of templates
-                    // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                    auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, IsEvenMNConst && IsEvenKConst && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !ReturnSoftmaxConst, Is_softcap, ReturnSoftmaxConst && Is_dropout && !Is_softcap, UseDynamicMaskConst>;
-                    if (smem_size >= 48 * 1024) {
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                    }
-                    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
-                });
+                // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                // If return_softmax, set IsEvenMNConst to false to reduce number of templates
+                // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
+                auto kernel = &flash_fwd_kernel<Kernel_traits, Is_causal, IsEvenMNConst && IsEvenKConst && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !ReturnSoftmaxConst, ReturnSoftmaxConst>;
+                if (smem_size >= 48 * 1024) {
+                    C10_CUDA_CHECK(cudaFuncSetAttribute(
+                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                }
+                kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
     });
@@ -104,18 +100,15 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             BOOL_SWITCH(params.num_splits > 1, Split, [&] {
                 BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
-                    SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                        
-                        // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
-                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                        auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, IsEvenMNConst && !Append_KV && IsEvenKConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, Split, Append_KV, UseDynamicMaskConst>;
-                        if (smem_size >= 48 * 1024) {
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                        }
-                        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
-                    });
+                    // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
+                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                    auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, IsEvenMNConst && !Append_KV && IsEvenKConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Split, Append_KV>;
+                    if (smem_size >= 48 * 1024) {
+                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                    }
+                    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
             });
         });
@@ -127,24 +120,21 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-            // Also check for dynamic mask here
-            DYNAMIC_MASK_SWITCH(use_dynamic_mask, UseDynamicMaskConst, [&] {
-                if (params.num_splits <= 2) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                } else if (params.num_splits <= 4) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                } else if (params.num_splits <= 8) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                } else if (params.num_splits <= 16) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                } else if (params.num_splits <= 32) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                } else if (params.num_splits <= 64) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                } else if (params.num_splits <= 128) {
-                    flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst, UseDynamicMaskConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
-                }
-            });
+            if (params.num_splits <= 2) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            } else if (params.num_splits <= 4) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            } else if (params.num_splits <= 8) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            } else if (params.num_splits <= 16) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            } else if (params.num_splits <= 32) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            } else if (params.num_splits <= 64) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            } else if (params.num_splits <= 128) {
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     }
@@ -156,50 +146,22 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    
-    // Pass the dynamic mask flag appropriately
-    const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-    if (use_dynamic_mask) {
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
-    } else {
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
-    }
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Check for dynamic mask
-        const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-        DYNAMIC_MASK_SWITCH(use_dynamic_mask, Is_dynamic, [&] {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-        });
-    });
+    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Check for dynamic mask
-        const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-        DYNAMIC_MASK_SWITCH(use_dynamic_mask, Is_dynamic, [&] {
-            if constexpr(!Is_dropout) {
-                // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
-                // Using block size (64 x 256) is 27% slower for seqlen=2k
-                // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
-            } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
-                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
-                // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        });
-    });
+    // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
+    // Using block size (64 x 256) is 27% slower for seqlen=2k
+    // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
+    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>
@@ -207,22 +169,16 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Check for dynamic mask
-        const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-        DYNAMIC_MASK_SWITCH(use_dynamic_mask, Is_dynamic, [&] {
-            // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
-            if (is_sm8x) {
-                if constexpr(!Is_causal) {
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                } else {
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                }
-            } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        });
-    });
+    // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
+    if (is_sm8x) {
+        if constexpr(!Is_causal) {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+        } else {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
+        }
+    } else {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, bool Is_causal>
@@ -230,43 +186,23 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Check for dynamic mask
-        const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-        DYNAMIC_MASK_SWITCH(use_dynamic_mask, Is_dynamic, [&] {
-            if constexpr(!Is_dropout) {
-                // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
-                // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
-                if (is_sm8x) {
-                    if constexpr(!Is_causal) {
-                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                    } else {
-                        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                    }
-                } else {
-                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-                }
-            } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        });
-    });
+    // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
+    // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
+    if (is_sm8x) {
+        if constexpr(!Is_causal) {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_causal>(params, stream);
+        } else {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
+        }
+    } else {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Check for dynamic mask
-        const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-        DYNAMIC_MASK_SWITCH(use_dynamic_mask, Is_dynamic, [&] {
-            if constexpr(!Is_dropout) {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        });
-    });
+    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>
@@ -283,19 +219,13 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
       C10_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Check for dynamic mask
-        const bool use_dynamic_mask = params.zero_hold_ptr != nullptr && params.keep_window_size > 0;
-        DYNAMIC_MASK_SWITCH(use_dynamic_mask, Is_dynamic, [&] {
-            // For A100, we want to run with 128 x 64 (128KB smem).
-            // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
-            if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
-            }
-        });
-    });
+    // For A100, we want to run with 128 x 64 (128KB smem).
+    // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
+    if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_causal>(params, stream);
+    } else {
+        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_causal>(params, stream);
+    }
 }
 
 } // namespace FLASH_NAMESPACE
