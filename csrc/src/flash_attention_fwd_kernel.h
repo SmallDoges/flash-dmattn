@@ -61,7 +61,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
-    constexpr int kNWarps = Kernel_traits::kNWarps;
 
     // Check if there are any queries to process in the block
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
@@ -75,8 +74,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
     }
 
-    // 如果没有N块要处理,设置输出为0并返回
-    if (n_block_max <= n_block_min) {
+    // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
+    // Otherwise we might read OOB elements from gK and gV.
+    if ((Is_causal || !Is_even_MN) && n_block_max <= n_block_min) {
         Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)), make_shape(binfo.actual_seqlen_q, params.h, params.d), make_stride(params.o_row_stride, params.o_head_stride, _1{}));
         Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
         Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
