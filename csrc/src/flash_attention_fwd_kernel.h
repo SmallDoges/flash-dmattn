@@ -201,46 +201,73 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             make_shape(1, 1),
             make_stride(0, 0)
         );
-                        
 
+    // Shared memory layout configuration
+    Tensor sQ = make_tensor(
+        make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+        typename Kernel_traits::SmemLayoutQ{}
+    );
+    // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
+    Tensor sK = make_tensor(
+        sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+        typename Kernel_traits::SmemLayoutKV{}
+    );
+    Tensor sV = make_tensor(
+        sK.data() + size(sK),
+        typename Kernel_traits::SmemLayoutKV{}
+    );
+    Tensor sVt = make_tensor(
+        sV.data(),
+        typename Kernel_traits::SmemLayoutVtransposed{}
+    );
+    Tensor sVtNoSwizzle = make_tensor(
+        sV.data().get(),
+        typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{}
+    );
 
-    // 共享内存配置
-    // QKV的共享内存布局
-    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
-                            typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
-                            typename Kernel_traits::SmemLayoutKV{});
-    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
-    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
-    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+    // Dynamic mask related shared memory. Use a running char* pointer for robust allocation.
+    char* dynamic_smem_current_ptr = reinterpret_cast<char*>(sV.data() + size(sV));
+    Tensor sZeroHold = make_tensor(
+        make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr)),
+        typename Kernel_traits::SmemLayoutZeroHold{}
+    );
 
-    // Dynamic mask的共享内存布局
-    Tensor sZeroHold = make_tensor(sV.data().get() + size(sV), typename Kernel_traits::SmemLayoutZeroHold{});
-    Tensor sCausalMask = params.causal_mask_ptr != nullptr
-                       ? make_tensor(sZeroHold.data().get() + size(sZeroHold),
-                            typename Kernel_traits::SmemLayoutZeroHold{})
-                       : Tensor();
+    dynamic_smem_current_ptr += Kernel_traits::kSmemZeroHoldSize;
+    auto causal_mask_layout_smem = typename Kernel_traits::SmemLayoutCausalMask{};
+    Tensor sCausalMask = has_causal_mask ?
+        make_tensor(make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr)), causal_mask_layout_smem)
+        : make_tensor(static_cast<Element*>(nullptr), make_shape(Int<1>{}, Int<1>{}), make_stride(0,0)); // Dummy
+
+    if (has_causal_mask) {
+        dynamic_smem_current_ptr += Kernel_traits::kSmemCausalMaskSize;
+    }
     Tensor sDynamicMaskValues = make_tensor(
-        (params.causal_mask_ptr != nullptr ? 
-            sCausalMask.data().get() + size(sCausalMask) : 
-            sZeroHold.data().get() + size(sZeroHold)),
+        make_smem_ptr(reinterpret_cast<float*>(dynamic_smem_current_ptr)), // float type
         typename Kernel_traits::SmemLayoutDynamicMaskValues{}
     );
+
+    dynamic_smem_current_ptr += Kernel_traits::kSmemMaskValuesSize;
     Tensor sDynamicMaskSortKeys = make_tensor(
-        sDynamicMaskValues.data().get() + size(sDynamicMaskValues),
+        make_smem_ptr(reinterpret_cast<float*>(dynamic_smem_current_ptr)), // float type
         typename Kernel_traits::SmemLayoutDynamicMaskSortKeys{}
     );
+
+    dynamic_smem_current_ptr += Kernel_traits::kSmemSortKeysSize;
     Tensor sDynamicMaskSortIndices = make_tensor(
-        sDynamicMaskSortKeys.data().get() + size(sDynamicMaskSortKeys),
+        make_smem_ptr(reinterpret_cast<int*>(dynamic_smem_current_ptr)), // int type
         typename Kernel_traits::SmemLayoutDynamicMaskSortIndices{}
     );
+
+    dynamic_smem_current_ptr += Kernel_traits::kSmemSortIndicesSize;
     Tensor sNonZeroIndices = make_tensor(
-        sDynamicMaskSortIndices.data().get() + size(sDynamicMaskSortIndices),
+        make_smem_ptr(reinterpret_cast<int*>(dynamic_smem_current_ptr)), // int type
         typename Kernel_traits::SmemLayoutNonZeroIndices{}
     );
+
+    dynamic_smem_current_ptr += Kernel_traits::kSmemNonZeroIndicesSize;
     Tensor sPredicate = make_tensor(
-        sNonZeroIndices.data().get() + size(sNonZeroIndices),
-        typename Kernel_traits::SmemLayoutZeroHold{}
+        make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr)), // Element type
+        typename Kernel_traits::SmemLayoutPredicate{}
     );
     
 
