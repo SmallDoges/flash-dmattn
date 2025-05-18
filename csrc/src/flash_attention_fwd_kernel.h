@@ -58,9 +58,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // The thread index.
     const int tidx = threadIdx.x;
 
-    constexpr int kBlockM = Kernel_traits::kBlockM;
-    constexpr int kBlockN = Kernel_traits::kBlockN;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kBlockM = Kernel_traits::kBlockM;    // query_block_len
+    constexpr int kBlockN = Kernel_traits::kBlockN;    // key_block_len
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;  // head_dim
 
     // Check if there are any queries to process in the block
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
@@ -70,8 +70,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const int n_block_min = 0;
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (Is_causal) {
-        n_block_max = std::min(n_block_max,
-                            cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
+        n_block_max = std::min(
+            n_block_max,
+            cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q, kBlockN)
+        );
     }
 
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
