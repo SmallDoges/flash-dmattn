@@ -77,19 +77,26 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
     if ((Is_causal || !Is_even_MN) && n_block_max <= n_block_min) {
-        Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)), make_shape(binfo.actual_seqlen_q, params.h, params.d), make_stride(params.o_row_stride, params.o_head_stride, _1{}));
-        Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+        Tensor mO = make_tensor(
+            make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr) + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+            make_shape(binfo.actual_seqlen_q, params.h, params.d), make_stride(params.o_row_stride, params.o_head_stride, _1{})
+        );
+        Tensor gO = local_tile(
+            mO(_, bidh, _),
+            Shape<Int<kBlockM>, Int<kHeadDim>>{},
+            make_coord(m_block, 0)
+        );  // (kBlockM, kHeadDim)
+
         Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
-        // 初始化输出为0
         typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
         Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
         Tensor tOrO = make_tensor<Element>(shape(tOgO));
         clear(tOrO);
-        
-        // 构建输出谓词
-        Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+        // Construct identity layout for sO
+        Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));  // (BLK_M,BLK_K) -> (blk_m,blk_k)
+        // Repeat the partitioning with identity layouts
         Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
         Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
         if (!Is_even_K) {
@@ -98,19 +105,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d;
             }
         }
-        
-        // 写出清零后的输出
-        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, false, false>(
+        // Clear_OOB_K must be false since we don't want to write zeros to gmem
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
             gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
         );
-        
-        // 设置LSE为无穷小
         #pragma unroll
         for (int m = 0; m < size<1>(tOgO); ++m) {
-            const int mi = get<0>(tOcO(0, m, 0));
-            if (mi < binfo.actual_seqlen_q - m_block * kBlockM) {
-                gLSE(mi) = -INFINITY;
-            }
+            const int row = get<0>(tOcO(0, m, 0));
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
         }
         return;
     }
