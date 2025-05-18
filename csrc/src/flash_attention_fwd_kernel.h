@@ -302,7 +302,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tSgS  = thr_mma.partition_C(gP);
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});   // MMA, MMA_M, MMA_K
     
-    // 设置从共享内存到寄存器的拷贝
+    // Copy Atom retiling
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
@@ -315,19 +315,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
     Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
 
-    auto smem_tiled_copy_ZeroHold = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
-    auto smem_thr_copy_ZeroHold = smem_tiled_copy_ZeroHold.get_thread_slice(tidx);
-    Tensor tSsZeroHold = smem_thr_copy_ZeroHold.partition_S(sZeroHold);
+    // For sZeroHold -> registers (if needed, though mask.h operates on smem directly)
+    // auto smem_tiled_copy_ZeroHold = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    // auto smem_thr_copy_ZeroHold = smem_tiled_copy_ZeroHold.get_thread_slice(tidx);
+    // Tensor tSsZeroHold = smem_thr_copy_ZeroHold.partition_S(sZeroHold);
 
-    auto smem_tiled_copy_CausalMask = params.causal_mask_ptr != nullptr 
-                                    ? make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma)
-                                    : decltype(make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma)){};
-    auto smem_thr_copy_CausalMask = params.causal_mask_ptr != nullptr
-                                  ? smem_tiled_copy_CausalMask.get_thread_slice(tidx)
-                                  : decltype(smem_tiled_copy_CausalMask.get_thread_slice(tidx)){};
-    Tensor tSsCausalMask = params.causal_mask_ptr != nullptr
-                         ? smem_thr_copy_CausalMask.partition_S(sCausalMask)
-                         : Tensor();
+    // For sCausalMask -> registers (if needed)
+    // using CausalMaskSmemCopyAtom = typename Kernel_traits::SmemCopyAtom; // Assuming Element type
+    // auto smem_tiled_copy_CausalMask_smem = make_tiled_copy_B(CausalMaskSmemCopyAtom{}, tiled_mma);
+    // auto smem_thr_copy_CausalMask_smem = smem_tiled_copy_CausalMask_smem.get_thread_slice(tidx);
+    // Tensor tSsCausalMask = has_causal_mask ? smem_thr_copy_CausalMask_smem.partition_S(sCausalMask) : empty_smem_tensor_for_copy_D;
 
     // 设置谓词
     Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
