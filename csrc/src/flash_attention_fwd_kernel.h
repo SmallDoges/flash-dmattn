@@ -269,9 +269,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr)), // Element type
         typename Kernel_traits::SmemLayoutPredicate{}
     );
-    
 
-    // 设置全局内存到共享内存的拷贝
+    // Golobal to Shared Memory operation
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
     typename Kernel_traits::GmemTiledCopyZeroHold gmem_tiled_copy_ZeroHold;
@@ -281,18 +280,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
-    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
+    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
-    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
+    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
     Tensor tZeroHoldgZeroHold = gmem_thr_copy_ZeroHold.partition_S(gZeroHold);
     Tensor tZeroHoldsZeroHold = gmem_thr_copy_ZeroHold.partition_D(sZeroHold);
-    Tensor tCausalMaskgCausalMask = params.causal_mask_ptr != nullptr
-                                  ? gmem_thr_copy_CausalMask.partition_S(gCausalMask)
-                                  : Tensor();
-    Tensor tCausalMasksCausalMask = params.causal_mask_ptr != nullptr
-                                  ? gmem_thr_copy_CausalMask.partition_D(sCausalMask)
-                                  : Tensor();
+    auto tCausalMaskgCausalMask = has_causal_mask ?
+        gmem_thr_copy_CausalMask.partition_S(gCausalMask) : 
+        make_tensor(static_cast<Element*>(nullptr), make_shape(Int<1>{}, Int<1>{}), make_stride(0,0));
+    auto tCausalMasksCausalMask = has_causal_mask ?
+        gmem_thr_copy_CausalMask.partition_D(sCausalMask) : 
+        make_tensor(static_cast<Element*>(nullptr), make_shape(Int<1>{}, Int<1>{}), make_stride(0,0));
 
     // 设置矩阵乘法操作
     typename Kernel_traits::TiledMma tiled_mma;
