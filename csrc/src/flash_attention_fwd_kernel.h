@@ -116,51 +116,89 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         return;
     }
+    // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
-    // 全局内存张量配置
-    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
-                                          + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
-                            make_stride(params.q_row_stride, params.q_head_stride, _1{}));
-    
-    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                           make_coord(m_block, 0));
+    // We iterate over the blocks in reverse order. This is because the last block is the only one
+    // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
+    // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
+
+    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
+        + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
+    bool has_causal_mask = params.causal_mask_ptr != nullptr;
+
+    // Golobal memory tensor configuration
+    Tensor mQ = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_q, params.h, params.d),
+        make_stride(params.q_row_stride, params.q_head_stride, _1{})
+    );
+    Tensor gQ = local_tile(
+        mQ(_, bidh, _),
+        Shape<Int<kBlockM>, Int<kHeadDim>>{},
+        make_coord(m_block, 0)
+    );  // (kBlockM, kHeadDim)
                            
-    Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
-                                          + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
-                            make_stride(params.k_row_stride, params.k_head_stride, _1{}));
-                            
-    Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                           make_coord(_, 0));
+    Tensor mK = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr) + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
+        make_stride(params.k_row_stride, params.k_head_stride, _1{})
+    );          
+    Tensor gK = local_tile(
+        mK(_, bidh / params.h_h_k_ratio, _),
+        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+        make_coord(_, 0)
+    );  // (kBlockN, kHeadDim, nblocksN)
                            
-    Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
-                                          + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
-                            make_stride(params.v_row_stride, params.v_head_stride, _1{}));
-                            
-    Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                           make_coord(_, 0));
-    
-    Tensor mZeroHold = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.zero_hold_ptr)
-                                               + bidb * params.zero_hold_batch_stride),
-                                 make_shape(params.h, binfo.actual_seqlen_q, binfo.actual_seqlen_k), // Assuming h is num_kv_heads for zero_hold
-                                 make_stride(params.zero_hold_head_stride, params.zero_hold_query_stride, _1{}));
-    Tensor gZeroHold = local_tile(mZeroHold(bidh / params.h_h_k_ratio, _, _), // Use bidh / params.h_h_k_ratio if zero_hold is per kv_head
-                              Shape<Int<kBlockM>, Int<kBlockN>>{},
-                              make_coord(m_block, 0)); // m_block for query row, n_block for key column
-    
-    Tensor mCausalMask = params.causal_mask_ptr != nullptr
-                       ? make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.causal_mask_ptr)
-                                                  + bidb * params.causal_mask_batch_stride),
-                                    make_shape(1, binfo.actual_seqlen_q, binfo.actual_seqlen_k),
-                                    make_stride(params.causal_mask_head_stride, params.causal_mask_query_len_stride, _1{}))
-                       : Tensor();  // Empty tensor if no causal mask is provided
-    Tensor gCausalMask = params.causal_mask_ptr != nullptr
-                       ? local_tile(mCausalMask(0, _, _),
-                                    Shape<Int<kBlockM>, Int<kBlockN>>{},
-                                    make_coord(_, 0))
-                       : Tensor();  // Empty tensor if no causal mask is provided
+    Tensor mV = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr) + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
+        make_stride(params.v_row_stride, params.v_head_stride, _1{})
+    );           
+    Tensor gV = local_tile(
+        mV(_, bidh / params.h_h_k_ratio, _),
+        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+        make_coord(_, 0)
+    );  // (kBlockN, kHeadDim, nblocksN)
+
+    Tensor gP = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
+        Shape<Int<kBlockM>, Int<kBlockN>>{},
+        make_stride(params.seqlen_k_rounded, _1{})
+    );
+
+    Tensor mZeroHold = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.zero_hold_ptr) + bidb * params.zero_hold_batch_stride),
+        make_shape(params.h_k, binfo.actual_seqlen_q, binfo.actual_seqlen_k),
+        make_stride(params.zero_hold_head_stride, params.zero_hold_query_stride, _1{})
+    );
+    Tensor gZeroHold = local_tile(
+        mZeroHold(bidh / params.h_h_k_ratio, _, _),
+        Shape<Int<kBlockM>, Int<kBlockN>>{},
+        make_coord(m_block, 0)
+    );
+
+    Tensor mCausalMask = has_causal_mask ? 
+        make_tensor(
+            make_gmem_ptr(reinterpret_cast<Element*>(params.causal_mask_ptr) + bidb * params.causal_mask_batch_stride),
+            make_shape(1, binfo.actual_seqlen_q, binfo.actual_seqlen_k),
+            make_stride(params.causal_mask_head_stride, params.causal_mask_query_len_stride, _1{})
+        ) :
+        make_tensor(
+            static_cast<Element*>(nullptr),
+            make_shape(1, 1, 1),
+            make_stride(0, 0, 0)
+        );
+    Tensor gCausalMask = has_causal_mask ?
+        local_tile(
+            mCausalMask(0, _, _),
+            Shape<Int<kBlockM>, Int<kBlockN>>{},
+            make_coord(m_block, 0)
+        ) :
+        make_tensor(
+            static_cast<Element*>(nullptr),
+            make_shape(1, 1),
+            make_stride(0, 0)
+        );
                         
 
 
