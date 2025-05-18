@@ -293,12 +293,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         gmem_thr_copy_CausalMask.partition_D(sCausalMask) : 
         make_tensor(static_cast<Element*>(nullptr), make_shape(Int<1>{}, Int<1>{}), make_stride(0,0));
 
-    // 设置矩阵乘法操作
+    // Matrix Multiply Accumulate
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
-    Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
-    Tensor tSrK = thr_mma.partition_fragment_B(sK);
-    Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
+    Tensor tSrQ = thr_mma.partition_fragment_A(sQ);                                         // (MMA,MMA_M,MMA_K)
+    Tensor tSrK = thr_mma.partition_fragment_B(sK);                                         // (MMA,MMA_N,MMA_K)
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);                              // (MMA, MMA_K,MMA_N)
+    Tensor tSgS  = thr_mma.partition_C(gP);
+    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});   // MMA, MMA_M, MMA_K
     
     // 设置从共享内存到寄存器的拷贝
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
