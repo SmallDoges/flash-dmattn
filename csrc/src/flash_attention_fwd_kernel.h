@@ -228,17 +228,20 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     );
 
     // Dynamic mask related shared memory. Use a running char* pointer for robust allocation.
-    char* dynamic_smem_current_ptr = reinterpret_cast<char*>(sV.data() + size(sV));
+    char* dynamic_smem_current_ptr = reinterpret_cast<char*>(sV.data().get() + size(sV) * sizeof(Element));
     Tensor sZeroHold = make_tensor(
         make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr)),
         typename Kernel_traits::SmemLayoutZeroHold{}
     );
 
     dynamic_smem_current_ptr += Kernel_traits::kSmemZeroHoldSize;
-    auto causal_mask_layout_smem = typename Kernel_traits::SmemLayoutCausalMask{};
-    Tensor sCausalMask = has_causal_mask ?
-        make_tensor(make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr)), causal_mask_layout_smem)
-        : make_tensor(static_cast<Element*>(nullptr), make_shape(Int<1>{}, Int<1>{}), make_stride(0,0)); // Dummy
+    auto causal_mask_smem_ptr = has_causal_mask
+    ? make_smem_ptr(reinterpret_cast<Element*>(dynamic_smem_current_ptr))
+    : make_smem_ptr(static_cast<Element*>(nullptr));
+    Tensor sCausalMask = make_tensor(
+        causal_mask_smem_ptr,
+        typename Kernel_traits::SmemLayoutCausalMask{}
+    );
 
     if (has_causal_mask) {
         dynamic_smem_current_ptr += Kernel_traits::kSmemCausalMaskSize;
