@@ -179,27 +179,29 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         make_coord(m_block, 0)
     );
 
-    Tensor mCausalMask = has_causal_mask ? 
+    auto mCausalMask = has_causal_mask ? 
         make_tensor(
             make_gmem_ptr(reinterpret_cast<Element*>(params.causal_mask_ptr) + bidb * params.causal_mask_batch_stride),
             make_shape(1, binfo.actual_seqlen_q, binfo.actual_seqlen_k),
             make_stride(params.causal_mask_head_stride, params.causal_mask_query_len_stride, _1{})
         ) :
         make_tensor(
-            static_cast<Element*>(nullptr),
+            make_gmem_ptr(static_cast<Element*>(nullptr)),
             make_shape(1, 1, 1),
-            make_stride(0, 0, 0)
+            make_stride(static_cast<flash::index_t>(0), static_cast<flash::index_t>(0), _1{})
         );
-    Tensor gCausalMask = has_causal_mask ?
+    
+    auto gCausalMask = has_causal_mask ?
         local_tile(
             mCausalMask(0, _, _),
             Shape<Int<kBlockM>, Int<kBlockN>>{},
             make_coord(m_block, 0)
         ) :
         make_tensor(
-            static_cast<Element*>(nullptr),
-            make_shape(1, 1),
-            make_stride(0, 0)
+            make_gmem_ptr(static_cast<Element*>(nullptr)),
+            make_layout(
+            Shape<Int<kBlockM>, Int<kBlockN>>{},
+            make_stride(static_cast<flash::index_t>(0), _1{}))
         );
 
     // Shared memory layout configuration
