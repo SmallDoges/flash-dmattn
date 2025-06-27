@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024, Tri Dao.
+ * Copyright (c) 2025, Jingze Shi and Tri Dao.
  ******************************************************************************/
 
 #pragma once
@@ -17,8 +17,6 @@
 #include "softmax.h"
 #include "mask.h"
 #include "dropout.h"
-
-#include "alibi.h"
 
 namespace FLASH_NAMESPACE {
 
@@ -77,7 +75,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -101,9 +99,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     if (n_block * kBlockN >= binfo.actual_seqlen_k) return;
 
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
-    if (Is_local) {
-        m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left, kBlockM));
-    }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -111,6 +106,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         + n_block * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
     const index_t row_offset_v = binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)
         + n_block * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+    const index_t row_offset_zoh = binfo.zoh_offset(params.zoh_batch_stride, params.zoh_row_stride, bidb)
+        + (m_block_max - 1) * kBlockM * params.zoh_row_stride + (bidh / params.h_h_k_ratio) * params.zoh_head_stride;
+    const index_t row_offset_active_mask = binfo.active_mask_offset(params.active_mask_batch_stride, params.active_mask_row_stride, bidb)
+        + (m_block_max - 1) * kBlockM * params.active_mask_row_stride + (bidh / params.h_h_k_ratio) * params.active_mask_head_stride;
     const index_t row_offset_do = binfo.q_offset(params.do_batch_stride, params.do_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.do_row_stride + bidh * params.do_head_stride;
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
@@ -121,6 +120,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded
         // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
         + (!params.deterministic ? 0 : blockIdx.x * params.dq_accum_split_stride);
+    const index_t row_offset_dzoh = binfo.zoh_offset(params.dzero_hold_batch_stride, params.dzero_hold_row_stride, bidb)
+        + (m_block_max - 1) * kBlockM * params.dzero_hold_row_stride + (bidh / params.h_h_k_ratio) * params.dzero_hold_head_stride;
     const index_t row_offset_lse = (params.unpadded_lse? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb): (bidb * params.h + bidh) * params.seqlen_q) + (m_block_max - 1) * kBlockM;
     // Regarding 128 * params.b see a comment in mha_varlen_bwd about padding of dq_accum and softmax_d
     const index_t row_offset_dpsum = (params.unpadded_lse? bidh * (params.total_q + 128 * params.b) + binfo.q_offset(params.seqlen_q_rounded, 1, bidb) + 128 * bidb: (bidb * params.h + bidh) * params.seqlen_q_rounded) + (m_block_max - 1) * kBlockM;
@@ -134,6 +135,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
+    Tensor gZOH = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.zoh_ptr) + row_offset_zoh),
+                              Shape<Int<kBlockM>, Int<kBlockN>>{},
+                              make_stride(params.zoh_row_stride, _1{}));
+    Tensor gActiveMask = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.active_mask_ptr) + row_offset_active_mask),
+                                     Shape<Int<kBlockM>, Int<kBlockN>>{},
+                                     make_stride(params.active_mask_row_stride, _1{}));
     Tensor gdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.do_ptr) + row_offset_do),
                              Shape<Int<kBlockM>, Int<kHeadDim>>{},
                              make_stride(params.do_row_stride, _1{}));
@@ -146,6 +153,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                   make_stride(params.h * params.d_rounded, _1{}));
+    Tensor gdZOH = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dzero_hold_ptr) + row_offset_dzoh),
+                               Shape<Int<kBlockM>, Int<kBlockN>>{},
+                               make_stride(params.dzero_hold_row_stride, _1{}));
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
     Tensor gdPsum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dsoftmax_sum) + row_offset_dpsum),
@@ -168,7 +178,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                              typename Kernel_traits::SmemLayoutPdS{});
     Tensor sdSt = make_tensor(sdS.data(), typename Kernel_traits::SmemLayoutPdStransposed{});
     Tensor sdStNoSwizzle = make_tensor(sdS.data(), typename Kernel_traits::SmemLayoutPdStransposedNoSwizzle{});
-    Tensor sP = make_tensor(sdS.data() + size(sdS), typename Kernel_traits::SmemLayoutPdS{});
+    Tensor sZOH = make_tensor(sdS.data() + size(sdS), typename Kernel_traits::SmemLayoutZOH{});
+    Tensor sActiveMask = make_tensor(sZOH.data() + size(sZOH), typename Kernel_traits::SmemLayoutActiveMask{});
+    Tensor sP = make_tensor(sActiveMask.data() + size(sActiveMask), typename Kernel_traits::SmemLayoutPdS{});
     Tensor sPt = make_tensor(sP.data(), typename Kernel_traits::SmemLayoutPdStransposed{});
     Tensor sPtNoSwizzle = make_tensor(sP.data(), typename Kernel_traits::SmemLayoutPdStransposedNoSwizzle{});
     // sP and sdQ share the same memory so be careful
@@ -176,6 +188,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+    typename Kernel_traits::GmemTiledCopyZOH gmem_tiled_copy_ZOH;
+    auto gmem_thr_copy_ZOH = gmem_tiled_copy_ZOH.get_thread_slice(tidx);
+    typename Kernel_traits::GmemTiledCopyActiveMask gmem_tiled_copy_ActiveMask;
+    auto gmem_thr_copy_ActiveMask = gmem_tiled_copy_ActiveMask.get_thread_slice(tidx);
     using GmemTiledCopydO = std::conditional_t<
         Is_first,
         typename Kernel_traits::GmemTiledCopydO,
@@ -210,13 +226,24 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx < 64) {
     //     printf("tidx = %d, tdQgdQaccum = 0x%p\n", tidx, tdQgdQaccum.data());
     // }
+    Tensor tZOHgZOH = gmem_thr_copy_ZOH.partition_S(gZOH);
+    Tensor tZOHsZOH = gmem_thr_copy_ZOH.partition_D(sZOH);
+    Tensor tActiveMaskgActiveMask = gmem_thr_copy_ActiveMask.partition_S(gActiveMask);
+    Tensor tActiveMasksActiveMask = gmem_thr_copy_ActiveMask.partition_D(sActiveMask);
+    Tensor tdZOHgdZOH = gmem_thr_copy_ZOH.partition_D(gdZOH);
 
     typename Kernel_traits::TiledMmaSdP tiled_mma_sdp;
     auto thr_mma_sdp = tiled_mma_sdp.get_thread_slice(tidx);
-    Tensor tSrQ = thr_mma_sdp.partition_fragment_A(sQ);         // (MMA,MMA_N,MMA_K)
-    Tensor tSrK = thr_mma_sdp.partition_fragment_B(sK);         // (MMA,MMA_N,MMA_K)
-    Tensor tdPrdO = thr_mma_sdp.partition_fragment_A(sdO);      // (MMA,MMA_N,MMA_K)
-    Tensor tdPrV = thr_mma_sdp.partition_fragment_B(sV);        // (MMA,MMA_N,MMA_K)
+    Tensor tSrQ = thr_mma_sdp.partition_fragment_A(sQ);                     // (MMA,MMA_N,MMA_K)
+    Tensor tSrK = thr_mma_sdp.partition_fragment_B(sK);                     // (MMA,MMA_N,MMA_K)
+    Tensor tSrZOH = thr_mma_sdp.partition_fragment_C(sZOH);                 // (MMA,MMA_M,MMA_N)
+    Tensor tSrActiveMask = thr_mma_sdp.partition_fragment_C(sActiveMask);   // (MMA,MMA_M,MMA_N)
+    Tensor tdPrdO = thr_mma_sdp.partition_fragment_A(sdO);                  // (MMA,MMA_N,MMA_K)
+    Tensor tdPrV = thr_mma_sdp.partition_fragment_B(sV);                    // (MMA,MMA_N,MMA_K)
+
+    // Dynamic mask support: Initialize ZOH gradients accumulator
+    Tensor acc_dzoh = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+    clear(acc_dzoh);
 
     typename Kernel_traits::TiledMmadKV tiled_mma_dkv;
     auto thr_mma_dkv = tiled_mma_dkv.get_thread_slice(tidx);
@@ -306,6 +333,23 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
 
+    // Dynamic mask support: Predicates for ZOH and Active Mask boundaries
+    Tensor cZOH = make_identity_tensor(make_shape(size<0>(sZOH), size<1>(sZOH)));    // (BLK_M,BLK_N) -> (blk_m,blk_n)
+    Tensor tZOHcZOH = gmem_thr_copy_ZOH.partition_D(cZOH);
+    Tensor tZOHpZOH = make_tensor<bool>(make_shape(size<2>(tZOHgZOH)));
+    
+    Tensor cActiveMask = make_identity_tensor(make_shape(size<0>(sActiveMask), size<1>(sActiveMask)));  
+    Tensor tActiveMaskcActiveMask = gmem_thr_copy_ActiveMask.partition_D(cActiveMask);
+    Tensor tActiveMaskpActiveMask = make_tensor<bool>(make_shape(size<2>(tActiveMaskgActiveMask)));
+    
+    // Set predicates for dynamic mask bounds  
+    if (!Is_even_MN) {
+        #pragma unroll
+        for (int i = 0; i < size(tZOHpZOH); ++i) { tZOHpZOH(i) = true; }  // Simplify for now
+        #pragma unroll  
+        for (int i = 0; i < size(tActiveMaskpActiveMask); ++i) { tActiveMaskpActiveMask(i) = true; }
+    }
+
     // Prologue
 
     // We'll advance gdQ and gdQaccum before the 1st read/write.
@@ -313,9 +357,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     tdQgdQaccum.data() = tdQgdQaccum.data() + kBlockM * params.h * params.d_rounded;
 
     int m_block = m_block_max - 1;
-    int m_block_min = (!Is_causal && !Is_local)
+    int m_block_min = (!Is_causal)
         ? 0
-        : std::max(0, (n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right) / kBlockM);
+        : std::max(0, (n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k) / kBlockM);
     // If not local, we're guaranteed that m_block_min <= m_block:
     // We checked earlier that n_block * kBlockN < actual_seqlen_k, so in the causal case,
     // n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k < actual_seqlen_q.
@@ -328,7 +372,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // Otherwise we get wrong result for the case where we don't enter the for loop.
     // And we might read OOB elements from gQ and gdO.
     // This also covers the case where actual_seqlen_q == 0
-    if ((Is_local || !Is_even_MN) && m_block < m_block_min) {
+    if ((!Is_even_MN) && m_block < m_block_min) {
         const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
           + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
         const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
@@ -397,6 +441,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
     );
 
+    // Dynamic mask support: Load ZOH states and Active Mask data 
+    FLASH_NAMESPACE::copy_ZOH<Is_even_MN, /*Clear_OOB_MN=*/true>(
+        gmem_tiled_copy_ZOH, tZOHgZOH, tZOHsZOH, tZOHcZOH,
+        binfo.actual_seqlen_q - m_block * kBlockM, binfo.actual_seqlen_k - n_block * kBlockN
+    );
+    FLASH_NAMESPACE::copy_ZOH<Is_even_MN, /*Clear_OOB_MN=*/true>(
+        gmem_tiled_copy_ActiveMask, tActiveMaskgActiveMask, tActiveMasksActiveMask, tActiveMaskcActiveMask,
+        binfo.actual_seqlen_q - m_block * kBlockM, binfo.actual_seqlen_k - n_block * kBlockN
+    );
+
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
     Tensor taccScS = thr_mma_sdp.partition_C(caccS);                           // (MMA,MMA_N,MMA_N)
     static_assert(decltype(size<0>(taccScS))::value == 4);
@@ -410,8 +464,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
     // We want LSE = inf if the row is OOB. In that case Q would be zero, K would be zero,
     // and scores would be zero. With LSE = 0, probs will be all 1's, and when we multiply
-    // with V (which would be zero), we're fine. However, with ALiBi, we might modify these
-    // scores, and probs can become NaN. Instead if we set LSE = inf for OOB rows, probs are always 0.
+    // with V (which would be zero), we're fine.
 
     // Tensor tKrK = make_fragment_like(tKsK);
     // // cute::copy(gmem_tiled_copy_QKV, tKgK(_, _, _, 0), tKrK);
@@ -449,9 +502,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
-    const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
-
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
@@ -469,7 +519,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         //     cute::copy(smem_tiled_copy_KV, tSsK(_, _, k), tSrK_copy_view(_, _, k));
         // }
         // if (cute::thread0()) { print(tSrK); }
-        FLASH_NAMESPACE::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
+        // Dynamic mask support: Use sparse GEMM for QK^T computation based on Active Mask
+        FLASH_NAMESPACE::sparse_gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tSrActiveMask, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
         if constexpr (Is_softcap) {
@@ -480,16 +531,22 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
 
+        // Dynamic mask support: Apply dynamic mask with ZOH states and Active Mask
+        const int col_idx_offset = n_block * kBlockN;
+        const int row_idx_offset = m_block * kBlockM; 
+        const int warp_row_stride = 16; // This should match the MMA layout
+
+        // Create DynamicMask instance for applying mask logic
+        FLASH_NAMESPACE::DynamicMask<Is_causal> dynamic_mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.keep_window_size);
+        dynamic_mask.template apply_mask<Is_causal, Is_even_MN>(
+            acc_s, tSrZOH, tSrActiveMask, params.scale_softmax, 
+            col_idx_offset, row_idx_offset, warp_row_stride
+        );
+
         // Softcapping - calculating dTanh and scaling dS later with it
         [[maybe_unused]] Tensor dtanh = make_tensor_like(scores);
         if constexpr (Is_softcap) {
             FLASH_NAMESPACE::calculate_dtanh(scores, dtanh, params.softcap);
-        }
-
-        // Alibi
-        if (Has_alibi) {
-            alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                              m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
         }
 
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
@@ -499,7 +556,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // However, it's possible that the values in acc_s are so large that they overflow
         // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
         // So we need to mask out the elements beyond actual_seqlen_k.
-        if (!Is_causal && !Is_local) {
+        if (!Is_causal) {
             if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
                 FLASH_NAMESPACE::apply_mask(scores, binfo.actual_seqlen_k,
                                   n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16);
@@ -517,16 +574,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                          // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                          AtomLayoutMS * 16);
             }
-        } else if (Is_local) {
-            if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right
-                || (m_block + 1) * kBlockM >= n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left
-                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
-                FLASH_NAMESPACE::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                        binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
-                                        binfo.actual_seqlen_q, AtomLayoutMS * 16,
-                                        params.window_size_left, params.window_size_right);
-            }
-
         }
 
         // if (cute::thread(32, 0)) { print(scores); }
@@ -572,8 +619,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // if (cute::thread0()) { print(dP_sum); }
 
-        FLASH_NAMESPACE::gemm</*A_in_regs=*/false, /*B_in_regs=*/Kernel_traits::Is_V_in_regs>(
-            acc_dp, tdPrdO, tdPrV, tdPsdO, tdPsV, tiled_mma_sdp,
+        // Dynamic mask support: Use sparse GEMM for dP computation (dO @ V^T) based on Active Mask
+        FLASH_NAMESPACE::sparse_gemm</*A_in_regs=*/false, /*B_in_regs=*/Kernel_traits::Is_V_in_regs>(
+            acc_dp, tdPrdO, tdPrV, tdPsdO, tdPsV, tSrActiveMask, tiled_mma_sdp,
             smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV
         );
 
@@ -591,6 +639,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 dS(mi, ni) = scaled_ds;
             }
         }
+
+        // Dynamic mask support: Apply backward mask and accumulate ZOH gradients  
+        Tensor dS_reshaped = make_tensor(dS.data(), acc_dp.layout());
+        FLASH_NAMESPACE::DynamicMask<Is_causal> dynamic_mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.keep_window_size);
+        dynamic_mask.template apply_mask_backward<Is_causal, Is_even_MN>(
+            dS_reshaped, tSrZOH, tSrActiveMask, acc_dzoh, params.scale_softmax,
+            n_block * kBlockN, m_block * kBlockM, 16  // warp_row_stride
+        );
         // if (cute::thread0()) { print(dS); }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
@@ -630,7 +686,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // FLASH_NAMESPACE::gemm_rs(acc_dv, tdVrPt, tdVrdO, tdVsdOt, tiled_mma_dkv, smem_thr_copy_QdOt);
         // Tensor tdKrdSt = make_tensor(tdSrdS.data(), tdVrPt.layout());
         // FLASH_NAMESPACE::gemm_rs(acc_dk, tdKrdSt, tdKrQt, tdKsQt, tiled_mma_dkv, smem_thr_copy_QdOt);
-        FLASH_NAMESPACE::gemm(acc_dv, tdVrPt, tdVrdO, tdVsPt, tdVsdOt, tiled_mma_dkv,
+        // Dynamic mask support: Use sparse GEMM for dV computation based on attention weights
+        FLASH_NAMESPACE::sparse_gemm(acc_dv, tdVrPt, tdVrdO, tdVsPt, tdVsdOt, tSrActiveMask, tiled_mma_dkv,
                     smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
         // if (cute::thread0() && n_block == 0 && m_block == 0) { print(tdVrPt); }
         // if (cute::thread0()) { print(acc_dv); }
@@ -650,7 +707,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             }
         }
 
-        FLASH_NAMESPACE::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
+        // Dynamic mask support: Use sparse GEMM for dQ computation based on Active Mask
+        FLASH_NAMESPACE::sparse_gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tSrActiveMask, tiled_mma_dq,
                     smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
         // if (cute::thread0()) { print(acc_dq); }
 
@@ -659,6 +717,21 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) { lse(mi) = gLSE(get<0>(taccScS_row(mi))); }
             gdPsum.data() = gdPsum.data() + (-int(kBlockM));
+            
+            // Dynamic mask support: Advance ZOH and Active Mask pointers
+            tZOHgZOH.data() = tZOHgZOH.data() + (-int(kBlockM * params.zoh_row_stride));
+            tActiveMaskgActiveMask.data() = tActiveMaskgActiveMask.data() + (-int(kBlockM * params.active_mask_row_stride));
+            tdZOHgdZOH.data() = tdZOHgdZOH.data() + (-int(kBlockM * params.dzero_hold_row_stride));
+            
+            // Load next block of ZOH and Active Mask data
+            FLASH_NAMESPACE::copy_ZOH<Is_even_MN, /*Clear_OOB_MN=*/true>(
+                gmem_tiled_copy_ZOH, tZOHgZOH, tZOHsZOH, tZOHcZOH,
+                binfo.actual_seqlen_q - (m_block - 1) * kBlockM, binfo.actual_seqlen_k - n_block * kBlockN
+            );
+            FLASH_NAMESPACE::copy_ZOH<Is_even_MN, /*Clear_OOB_MN=*/true>(
+                gmem_tiled_copy_ActiveMask, tActiveMaskgActiveMask, tActiveMasksActiveMask, tActiveMaskcActiveMask,
+                binfo.actual_seqlen_q - (m_block - 1) * kBlockM, binfo.actual_seqlen_k - n_block * kBlockN
+            );
         }
 
         if (!Is_last) {
@@ -684,7 +757,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
         }
 
-        FLASH_NAMESPACE::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
+        // Dynamic mask support: Use sparse GEMM for dK computation based on Active Mask  
+        FLASH_NAMESPACE::sparse_gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tSrActiveMask, tiled_mma_dkv,
                     smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
         // if (cute::thread0()) { print(acc_dk); }
         if (Double_buffer) {  // Double buffer for sQ
@@ -719,6 +793,33 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             }
         }
 
+    }
+
+    // Dynamic mask support: Write accumulated dZOH gradients back to global memory
+    if (params.dzero_hold_ptr != nullptr) {
+        // Convert acc_dzoh from fp32 to fp16/bf16
+        Tensor rdZOH = FLASH_NAMESPACE::convert_type<Element>(acc_dzoh);
+        Tensor sdZOH = make_tensor(sZOH.data(), typename Kernel_traits::SmemLayoutZOH{});
+        
+        // Copy dZOH to shared memory
+        auto smem_tiled_copy_dZOH = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma_sdp);
+        auto smem_thr_copy_dZOH = smem_tiled_copy_dZOH.get_thread_slice(tidx);
+        Tensor taccdZOHrdZOH = smem_thr_copy_dZOH.retile_S(rdZOH);
+        Tensor taccdZOHsdZOH = smem_thr_copy_dZOH.partition_D(sdZOH);
+        
+        cute::copy(smem_tiled_copy_dZOH, taccdZOHrdZOH, taccdZOHsdZOH);
+        __syncthreads();
+        
+        // Copy from shared memory to global memory
+        Tensor tdZOHsdZOH = gmem_thr_copy_ZOH.partition_S(sdZOH);
+        Tensor tdZOHrdZOH = make_tensor<Element>(shape(tdZOHgdZOH));
+        cute::copy(gmem_tiled_copy_ZOH, tdZOHsdZOH, tdZOHrdZOH);
+        
+        // Write to global memory with bounds checking
+        FLASH_NAMESPACE::copy_ZOH<Is_even_MN, /*Clear_OOB_MN=*/false>(
+            gmem_tiled_copy_ZOH, tdZOHrdZOH, tdZOHgdZOH, tZOHcZOH,
+            binfo.actual_seqlen_q - (m_block_max - 1) * kBlockM, binfo.actual_seqlen_k - n_block * kBlockN
+        );
     }
 
     // Epilogue
@@ -794,7 +895,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_M, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     // The block index for the batch.
@@ -808,20 +909,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     if (n_block_max == 1) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
         for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
-            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
+            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // The block index for the batch.
@@ -831,7 +932,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }
 
