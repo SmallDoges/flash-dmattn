@@ -306,20 +306,39 @@ struct Flash_bwd_kernel_traits : public Base {
         make_shape(Int<kBlockM>{}, Int<kHeadDim>{})));
     using SmemCopyAtomdQ = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, elem_type>;
 
+    // Dynamic mask support: ZOH and Active Mask layouts (reuse from forward pass)
+    using SmemLayoutAtomZOH = decltype(
+        composition(Swizzle<kSwizzle, 3, 3>{},
+                    Layout<Shape<_8, _8>,
+                    Stride<_8, _1>>{}));
+    using SmemLayoutAtomActiveMask = decltype(
+        composition(Swizzle<kSwizzle, 3, 3>{},
+                    Layout<Shape<_8, _8>,
+                    Stride<_8, _1>>{}));
+
+    using SmemLayoutZOH = decltype(tile_to_shape(
+        SmemLayoutAtomZOH{},
+        Shape<Int<kBlockM>, Int<kBlockN>>{}));
+    using SmemLayoutActiveMask = decltype(tile_to_shape(
+        SmemLayoutAtomActiveMask{},
+        Shape<Int<kBlockM>, Int<kBlockN>>{}));
+
     // Double buffer for sQ
     static constexpr int kSmemQdOSize = size(SmemLayoutQdO{}) * (No_double_buffer ? 2 : 3) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemdSSize = size(SmemLayoutPdS{}) * sizeof(Element);
     static constexpr int kSmemPSize = size(SmemLayoutPdS{}) * sizeof(Element);
     static constexpr int kSmemdQSize = size(SmemLayoutdQ{}) * sizeof(Element);
+    // Dynamic mask support: Add ZOH and Active Mask memory sizes
+    static constexpr int kSmemMaskSize = size(SmemLayoutZOH{}) * sizeof(Element) + size(SmemLayoutActiveMask{}) * sizeof(Element);
     static constexpr int kSmemSize = kSmemQdOSize
         + (!Is_V_in_regs
-           ? kSmemKVSize + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)
-           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)));
+           ? kSmemKVSize + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize) + kSmemMaskSize
+           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)) + kSmemMaskSize);
     static constexpr int kSmemSize1colblock = kSmemQdOSize
         + (!Is_V_in_regs
-           ? kSmemKVSize + kSmemdSSize + kSmemPSize
-           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));
+           ? kSmemKVSize + kSmemdSSize + kSmemPSize + kSmemMaskSize
+           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize) + kSmemMaskSize);
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
@@ -341,6 +360,14 @@ struct Flash_bwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+    using GmemTiledCopyZOH = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));      // Val layout, 8 vals per read
+    using GmemTiledCopyActiveMask = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));      // Val layout, 8 vals per read
     using GmemTiledCopydO = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, elem_type>{},
                         GmemLayoutAtom{},
