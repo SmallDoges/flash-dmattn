@@ -739,6 +739,43 @@ __forceinline__ __device__ void sparse_gemm_impl(
 2. **Register Allocation**: Critical masking operations performed in registers to minimize memory traffic
 3. **Coalesced Access**: Memory access patterns optimized for GPU memory hierarchy
 4. **Template Specialization**: Compile-time optimization eliminates runtime branching
+5. **Block-Level Sparse Optimization**: Advanced sparsity analysis with early branching and active block batching
+
+#### Block-Level Sparse GEMM Optimizations
+
+The optimized sparse GEMM implementation provides better Tensor Core utilization through:
+
+**Approach 1: Early Branching**
+- Analyzes sparsity patterns at MMA block granularity before computation
+- Branches computation into three optimized paths:
+  - **Dense Path**: All MMA blocks active → Full Tensor Core utilization
+  - **Sparse Path**: Mixed sparsity → Selective computation with mask handling
+  - **Empty Path**: No active blocks → Skip computation entirely
+
+**Approach 2: Active Block Batching**
+- Pre-counts active MMA blocks requiring computation
+- Optimizes memory loading based on sparsity density
+- Reduces unnecessary data movement for fully masked regions
+
+```cpp
+// Optimized sparse GEMM with block-level analysis
+if (active_block_count == 0) {
+    // Empty path: Skip all computation, clear registers
+    return;
+} else if (active_block_count == num_mma_blocks) {
+    // Dense path: Full Tensor Core utilization
+    cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+} else {
+    // Sparse path: Mixed computation with mask awareness
+    cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+}
+```
+
+**Benefits:**
+- Better Tensor Core utilization for structured sparse patterns
+- Reduced computation overhead for sparse blocks
+- Maintains warp coherency while enabling block-level optimization
+- Compatible with existing mask application logic
 
 ## Memory Layout
 
