@@ -180,25 +180,28 @@ __forceinline__ __device__ void sparse_gemm(
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));             // M
     auto tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));             // N
-    // Check if any element in the entire active mask is non-zero
-    // Use thread-local computation then sync across all threads in the CTA
-    bool local_any_active = false;
+    
+    // Block-level sparsity analysis: check each MMA block individually for better Tensor Core utilization
+    bool block_active[decltype(size<0>(tCrM))::value];
+    bool any_block_active = false;
     #pragma unroll
-    for (int mma = 0; mma < size<0>(tCrM) && !local_any_active; ++mma) {
+    for (int mma = 0; mma < size<0>(tCrM); ++mma) {
+        bool local_mma_active = false;
         #pragma unroll
-        for (int m = 0; m < size<1>(tCrM) && !local_any_active; ++m) {
+        for (int m = 0; m < size<1>(tCrM) && !local_mma_active; ++m) {
             #pragma unroll
-            for (int n = 0; n < size<2>(tCrM) && !local_any_active; ++n) {
-                // Use direct comparison to avoid potential branching
-                local_any_active |= (tCrM(mma, m, n) > 0);
+            for (int n = 0; n < size<2>(tCrM) && !local_mma_active; ++n) {
+                local_mma_active |= (tCrM(mma, m, n) > 0);
             }
         }
+        // Synchronize activity status across all threads in the CTA for this MMA block
+        block_active[mma] = __syncthreads_or(local_mma_active);
+        any_block_active |= block_active[mma];
     }
-    // Ensure all threads in the CTA have the same any_active value to avoid warp divergence
-    bool any_active = __syncthreads_or(local_any_active);
+    
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
     if (!B_in_regs) {
-        if (any_active) {
+        if (any_block_active) {
             // If any MMA block is active, load normally like dense gemm
             cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
         } else {
@@ -211,7 +214,7 @@ __forceinline__ __device__ void sparse_gemm(
         if (i < size<2>(tCrA) - 1) {
             if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
             if (!B_in_regs) {
-                if (any_active) {
+                if (any_block_active) {
                     // If any MMA block is active, load normally like dense gemm
                     cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
                 } else {
@@ -220,9 +223,13 @@ __forceinline__ __device__ void sparse_gemm(
                 }
             }
         }
-        // Only perform GEMM if there are any active elements
-        if (any_active) {
-            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        // Perform block-level sparse GEMM: only compute for active MMA blocks
+        #pragma unroll
+        for (int mma = 0; mma < size<0>(tCrA); ++mma) {
+            if (block_active[mma]) {
+                // Only perform GEMM for this MMA block if it has active elements
+                cute::gemm(tiled_mma, tCrA(mma, _, i), tCrB(mma, _, i), acc(mma, _, _));
+            }
         }
     }
 }
@@ -268,23 +275,24 @@ __forceinline__ __device__ void sparse_gemm_rs(
     // Retile B for thread-wise copy from shared memory to registers
     auto tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));             // N
-    // Check if any element in the entire active mask is non-zero
-    // Use thread-local computation then sync across all threads in the CTA
-    bool local_any_active = false;
+    // Block-level sparsity analysis: check each MMA block individually for better Tensor Core utilization
+    bool block_active[decltype(size<0>(tCrM))::value];
+    bool any_block_active = false;
     #pragma unroll
-    for (int mma = 0; mma < size<0>(tCrM) && !local_any_active; ++mma) {
+    for (int mma = 0; mma < size<0>(tCrM); ++mma) {
+        bool local_mma_active = false;
         #pragma unroll
-        for (int m = 0; m < size<1>(tCrM) && !local_any_active; ++m) {
+        for (int m = 0; m < size<1>(tCrM) && !local_mma_active; ++m) {
             #pragma unroll
-            for (int n = 0; n < size<2>(tCrM) && !local_any_active; ++n) {
-                // Use direct comparison to avoid potential branching
-                local_any_active |= (tCrM(mma, m, n) > 0);
+            for (int n = 0; n < size<2>(tCrM) && !local_mma_active; ++n) {
+                local_mma_active |= (tCrM(mma, m, n) > 0);
             }
         }
+        // Synchronize activity status across all threads in the CTA for this MMA block
+        block_active[mma] = __syncthreads_or(local_mma_active);
+        any_block_active |= block_active[mma];
     }
-    // Ensure all threads in the CTA have the same any_active value to avoid warp divergence
-    bool any_active = __syncthreads_or(local_any_active);
-    if (any_active) {
+    if (any_block_active) {
         // If any MMA block is active, load normally like dense gemm
         cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     } else {
@@ -294,7 +302,7 @@ __forceinline__ __device__ void sparse_gemm_rs(
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
         if (i < size<2>(tCrA) - 1) {
-            if (any_active) {
+            if (any_block_active) {
                 // If any MMA block is active, load normally like dense gemm
                 cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
             } else {
@@ -302,9 +310,13 @@ __forceinline__ __device__ void sparse_gemm_rs(
                 cute::clear(tCrB_copy_view(_, _, i + 1));
             }
         }
-        // Only perform GEMM if there are any active elements
-        if (any_active) {
-            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        // Perform block-level sparse GEMM: only compute for active MMA blocks
+        #pragma unroll
+        for (int mma = 0; mma < size<0>(tCrA); ++mma) {
+            if (block_active[mma]) {
+                // Only perform GEMM for this MMA block if it has active elements
+                cute::gemm(tiled_mma, tCrA(mma, _, i), tCrB(mma, _, i), acc(mma, _, _));
+            }
         }
     }
 }
