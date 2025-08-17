@@ -5,6 +5,8 @@
 #pragma once
 
 #include <tuple>
+#include <string>
+#include <cstdlib>
 
 #if !defined(__CUDACC_RTC__)
 #include "cuda_runtime.h"
@@ -62,6 +64,7 @@ struct ArchOptimizationConfig {
     int preferred_block_n;
     int max_smem_usage_kb;
     bool enable_double_buffering;
+    bool enable_profiling;
 };
 
 inline ArchOptimizationConfig get_arch_optimization_config(int device, int seqlen_q, int seqlen_k, int batch_size) {
@@ -71,6 +74,13 @@ inline ArchOptimizationConfig get_arch_optimization_config(int device, int seqle
     config.use_async_copy = major >= 8;
     config.use_multi_level_smem = supports_sm90_features(device);
     config.enable_double_buffering = true;
+    config.enable_profiling = false;  // Can be enabled via environment variable
+    
+    // Check for performance profiling environment variable
+    const char* enable_profiling_env = std::getenv("FLASH_DMATTN_PROFILE_BACKWARD");
+    if (enable_profiling_env && std::string(enable_profiling_env) == "1") {
+        config.enable_profiling = true;
+    }
     
     // Get max shared memory per block
     int max_smem_per_block;
@@ -113,4 +123,16 @@ inline ArchOptimizationConfig get_arch_optimization_config(int device, int seqle
     }
     
     return config;
+}
+
+// Performance monitoring hook for backward pass optimization
+inline void log_backward_optimization_choice(const char* headdim_str, int device, 
+                                            int seqlen_q, int seqlen_k, int batch_size,
+                                            const char* optimization_choice) {
+    const char* enable_profiling_env = std::getenv("FLASH_DMATTN_PROFILE_BACKWARD");
+    if (enable_profiling_env && std::string(enable_profiling_env) == "1") {
+        auto [major, minor] = get_compute_capability(device);
+        printf("FLASH_DMATTN_PROFILE: HeadDim=%s, Arch=SM%d.%d, SeqQ=%d, SeqK=%d, Batch=%d, Choice=%s\n",
+               headdim_str, major, minor, seqlen_q, seqlen_k, batch_size, optimization_choice);
+    }
 }

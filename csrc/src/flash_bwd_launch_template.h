@@ -195,32 +195,44 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
       C10_CUDA_CHECK(status_);
     }
     
+    const char* optimization_choice = nullptr;
+    
     // Architecture-specific optimization selection for head dim 64
     if (supports_sm90_features(device)) {  // SM 9.0 (H100/H200)
         if (max_smem_per_block >= 144 * 1024) {
             // Use large block sizes for optimal bandwidth utilization on H100
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM90_LargeBlock_128x128";
         } else {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM90_MediumBlock_64x128_VinRegs";
         }
     } else if (supports_sm89_features(device)) {  // SM 8.9 (Ada/H200)
         if (max_smem_per_block >= 144 * 1024) {
             // Optimized configuration for Ada architecture
             if (params.seqlen_q >= 8192) {  // Long sequences
                 run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_causal>(params, stream);
+                optimization_choice = "SM89_VeryLongSeq_128x128";
             } else {
                 run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_causal>(params, stream);
+                optimization_choice = "SM89_StandardSeq_64x128_VinRegs";
             }
         } else {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM89_LowMem_64x128_VinRegs";
         }
     } else {  // SM 8.6 and below (A100, etc.)
         if (max_smem_per_block >= 144 * 1024) {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM86_Standard_128x128";
         } else {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM86_LowMem_64x128_VinRegs";
         }
     }
+    
+    // Log optimization choice for profiling
+    log_backward_optimization_choice("64", device, params.seqlen_q, params.seqlen_k, params.b, optimization_choice);
 }
 
 template<typename T, bool Is_causal>
@@ -259,32 +271,44 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
       C10_CUDA_CHECK(status_);
     }
     
+    const char* optimization_choice = nullptr;
+    
     // Architecture-specific optimization selection
     if (supports_sm90_features(device)) {  // SM 9.0 (H100/H200)
         if (max_smem_per_block >= 176 * 1024) {
             // Use large block sizes for optimal memory bandwidth on H100
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM90_LargeBlock_128x128";
         } else {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 4, 4, 2, false, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM90_MediumBlock_64x128";
         }
     } else if (supports_sm89_features(device)) {  // SM 8.9 (Ada/H200)
         if (max_smem_per_block >= 144 * 1024) {
             // Optimized for variable sequence lengths on Ada
             if (params.seqlen_q >= 4096) {
                 run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_causal>(params, stream);
+                optimization_choice = "SM89_LongSeq_128x64";
             } else {
                 run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_causal>(params, stream);
+                optimization_choice = "SM89_StandardSeq_64x128";
             }
         } else {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM89_LowMem_64x64_VinRegs";
         }
     } else {  // SM 8.6 and below (A100, etc.)
         if (max_smem_per_block >= 144 * 1024) {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM86_Standard_64x128";
         } else {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, false, T>, Is_causal>(params, stream);
+            optimization_choice = "SM86_LowMem_64x64_VinRegs";
         }
     }
+    
+    // Log optimization choice for profiling
+    log_backward_optimization_choice("128", device, params.seqlen_q, params.seqlen_k, params.b, optimization_choice);
 }
 
 template<typename T, bool Is_causal>
