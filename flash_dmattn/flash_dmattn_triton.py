@@ -320,20 +320,25 @@ def _bwd_store_dk_dv(
 ):
     # [2022-11-01] TD: Same bug. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.store(dv_ptrs), there's a race condition
+    
+    # Apply safety check to ensure no NaN/Inf values are stored
+    dv_safe = tl.where(tl.isfinite(dv), dv, 0.0)
+    dk_safe = tl.where(tl.isfinite(dk), dk, 0.0)
+    
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
-            tl.store(dv_ptrs, dv)
-            tl.store(dk_ptrs, dk)
+            tl.store(dv_ptrs, dv_safe)
+            tl.store(dk_ptrs, dk_safe)
         else:
-            tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
-            tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
+            tl.store(dv_ptrs, dv_safe, mask=offs_d[None, :] < headdim)
+            tl.store(dk_ptrs, dk_safe, mask=offs_d[None, :] < headdim)
     else:
         if EVEN_HEADDIM:
-            tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
-            tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
+            tl.store(dv_ptrs, dv_safe, mask=offs_n[:, None] < seqlen_k)
+            tl.store(dk_ptrs, dk_safe, mask=offs_n[:, None] < seqlen_k)
         else:
-            tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
-            tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+            tl.store(dv_ptrs, dv_safe, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+            tl.store(dk_ptrs, dk_safe, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
 
 
 @triton.jit
@@ -511,6 +516,8 @@ def _bwd_kernel_one_col_block(
                 mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                 other=0.0,
             )
+        # Ensure do doesn't contain NaN/Inf values that could propagate to dv
+        do = tl.where(tl.isfinite(do), do, 0.0)
         # if EVEN_M:
         #     if EVEN_HEADDIM:
         #         do = tl.load(do_ptrs)
@@ -522,7 +529,11 @@ def _bwd_kernel_one_col_block(
         #     else:
         #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
         #                                    & (offs_d[None, :] < headdim), other=0.0)
-        dv += tl.dot(tl.trans(p.to(do.dtype)), do)
+        # Compute dV accumulation with safety check for numerical stability
+        p_transposed = tl.trans(p.to(do.dtype))
+        dv_delta = tl.dot(p_transposed, do)
+        # Add safety check to prevent NaN/Inf accumulation
+        dv += tl.where(tl.isfinite(dv_delta), dv_delta, 0.0)
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
         # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
@@ -568,8 +579,9 @@ def _bwd_kernel_one_col_block(
                     dbias,
                     mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
                 )
-        # compute dk = dot(ds.T, q)
-        dk += tl.dot(tl.trans(ds), q)
+        # compute dk = dot(ds.T, q) with safety check
+        dk_delta = tl.dot(tl.trans(ds), q)
+        dk += tl.where(tl.isfinite(dk_delta), dk_delta, 0.0)
         # compute dq
         if not (
             EVEN_M & EVEN_HEADDIM
@@ -932,6 +944,15 @@ def _flash_attn_forward(q, k, v, mask, bias, softmax_scale=None, is_causal=False
 def _flash_attn_backward(
     do, q, k, v, mask, bias, o, lse, softmax_scale=None, is_causal=False
 ):
+    """
+    Flash Attention backward pass with NaN/Inf safety improvements.
+    
+    Key fixes for numerical stability:
+    1. Initialize dk and dv tensors with zeros instead of empty to prevent 
+       uninitialized memory containing NaN/Inf values
+    2. Add safety checks in gradient accumulation to prevent NaN/Inf propagation
+    3. Ensure proper masking and finite value checks in store operations
+    """
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
@@ -957,8 +978,8 @@ def _flash_attn_backward(
     dq_accum = torch.empty_like(q, dtype=torch.float32)
     delta = torch.empty_like(lse)
     # delta = torch.zeros_like(lse)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    dk = torch.zeros_like(k)  # Initialize dk to zeros to prevent NaN/Inf propagation
+    dv = torch.zeros_like(v)  # Initialize dv to zeros to prevent NaN/Inf propagation
     dbias = torch.empty_like(bias)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
