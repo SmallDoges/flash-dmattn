@@ -81,19 +81,34 @@ def prepare_dynamic_mask(
     """
     Calculate dynamic attention mask to mask tokens for sparse attention.
 
+    ⚠️ DESIGN NOTE: This function implements QUERY-AGNOSTIC masking.
+    The same ZOH-based importance scores are broadcast to ALL queries, meaning:
+    1. All queries attend to the same set of top-K keys
+    2. No query-specific key selection is performed
+    3. Optimization prioritizes efficiency over query-specific precision
+    
+    This approach works well for tasks with global importance patterns but may be
+    suboptimal for fine-grained associative recall tasks. See docs/design_choices.md
+    for detailed analysis and potential alternatives.
+
     Combine `zoh_states` with `attention_mask` to generate the final `attn_mask`.
 
     Args:
         hidden_states: Input hidden states to determine dtype minimum value
-        zoh_states: zoh_states of shape (batch_size, num_kv_heads, key_sequence_length)
+        zoh_states: [batch_size, num_kv_heads, key_sequence_length] - Value-based importance scores
         keep_window_size: Window size of tokens not dynamically masked
         attention_mask: Optional attention mask of shape (batch_size, 1, query_len, key_len)
     
     Returns:
         tuple: (attn_bias, attn_mask)
+            - attn_bias: [batch_size, num_kv_heads, query_len, key_len] - ZOH scores + masking
+            - attn_mask: [batch_size, num_kv_heads, query_len, key_len] - Binary active mask
     """
     min_dtype = torch.finfo(hidden_states.dtype).min
     dtype = hidden_states.dtype
+    
+    # 🔍 KEY INSIGHT: Broadcasting same importance scores to ALL queries
+    # Shape transformation: [batch, heads, key_len] -> [batch, heads, query_len, key_len]
     attn_bias = zoh_states[:, :, None, :].expand(
         -1, -1, hidden_states.shape[2], -1
     )  # [batch_size, num_kv_heads, query_len, key_len]
@@ -110,6 +125,8 @@ def prepare_dynamic_mask(
         )
     
     if attn_bias.shape[-1] > keep_window_size:
+        # 🔍 CRITICAL: TopK selection produces SAME keys for ALL queries
+        # This creates uniform attention patterns across all query positions
         topk_indices = torch.topk(
             attn_bias, keep_window_size, dim=-1, largest=True, sorted=False
         ).indices
@@ -125,14 +142,22 @@ def calculate_zoh_states(value_states, dt_proj, A):
     """
     Calculate zoh states for dynamic mask attention.
     
+    ⚠️ DESIGN NOTE: This function implements QUERY-AGNOSTIC importance scoring.
+    ZOH states are computed solely from Value vectors and contain no query-specific information.
+    The same importance scores will be broadcast to all queries, meaning all queries 
+    will attend to the same set of top-K keys.
+    
+    This design choice prioritizes computational efficiency over query-specific precision.
+    See docs/design_choices.md for detailed analysis of implications.
+    
     Args:
         value_states: [batch_size, num_kv_heads, key_len, head_dim]
-        dt_proj: [num_kv_heads, num_kv_heads * head_dim]
-        A: [num_kv_heads]
-        causal_mask: Optional causal mask
+        dt_proj: [num_kv_heads, num_kv_heads * head_dim] - Learned projection matrix
+        A: [num_kv_heads] - Scaling coefficients
     
     Returns:
-        zoh_states: [batch_size, num_kv_heads, key_len]
+        zoh_states: [batch_size, num_kv_heads, key_len] - Value-based importance scores
+                   Note: No query dimension - same scores applied to all queries
     """
     batch_size, _, key_len, _ = value_states.shape
     

@@ -685,21 +685,36 @@ sparse_gemm(acc_o, acc_s, tSrV, tSsS, tSsV, tSrActiveMask,
 
 ### Sparsity Pattern Recognition
 
-The Dynamic Mask Attention implements structured sparsity based on learned importance scores:
+The Dynamic Mask Attention implements structured sparsity based on learned importance scores using a **query-agnostic** approach:
 
 1. **ZOH State Computation**: `dt_states = exp(A * softplus(V @ dt_proj^T))`
+   - **Value-only computation**: Importance scores derived solely from Value vectors
    - Learned projection matrix `dt_proj` maps value features to importance scores
    - Coefficient `A` controls the dynamic range of importance values
    - Exponential activation ensures positive importance scores
+   - **Result shape**: `[batch, num_heads, key_len]` (no query dimension)
 
-2. **TopK Selection**: For sequences longer than `keep_window_size`:
-   - Select top-K most important positions per query token
+2. **Global Broadcasting and TopK Selection**: For sequences longer than `keep_window_size`:
+   - **Broadcast**: ZOH states expanded to all queries: `[batch, heads, key_len] → [batch, heads, query_len, key_len]`
+   - **Uniform selection**: Same top-K keys selected for ALL query positions
    - K = `keep_window_size` (typically 512-2048)
    - Maintains fixed computational complexity regardless of sequence length
+   - **Trade-off**: Computational efficiency vs. query-specific precision
 
 3. **Binary Active Mask**: 
    - 1.0 for positions selected by TopK (compute)
    - 0.0 for positions not selected (skip computation)
+   - **Same mask applied to all queries** within each attention head
+
+### Design Implications
+
+⚠️ **Important**: This query-agnostic design has significant implications:
+
+- **Suitable for**: Tasks with global importance patterns, document processing, content summarization
+- **Limitations**: May be suboptimal for fine-grained associative recall tasks requiring query-specific key selection
+- **Trade-off**: Prioritizes computational efficiency and simplicity over task-specific precision
+
+For detailed analysis of this design choice and its implications, see [Design Choices Documentation](design_choices.md).
 
 ### Sparse GEMM Implementation
 
