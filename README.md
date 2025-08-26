@@ -127,12 +127,18 @@ Flash-DMA combines two complementary techniques:
 
 The integration happens at the CUDA kernel level with several key components:
 
-- **ZOH States**: Pre-computed importance scores for key selection
+- **ZOH States**: Pre-computed importance scores for key selection (computed from Value vectors only)
 - **Active Masks**: Binary masks indicating which keys should be considered for each query
 - **Sparse Matrix Multiplication**: Custom CUDA kernels for efficient sparse attention computation
 - **Block-Based Processing**: Maintains Flash Attention's block-based approach for memory efficiency
 
 This creates a hybrid attention mechanism that achieves both memory and computational efficiency for long sequences.
+
+### Design Characteristics
+
+⚠️ **Important Design Note**: Flash-DMA uses a **query-agnostic** masking approach where the same set of keys is selected for all queries. This design choice prioritizes computational efficiency and works well for tasks with global importance patterns, but may be suboptimal for fine-grained associative recall tasks that require query-specific key selection.
+
+For detailed analysis of this design choice and its implications, see the [Design Choices Documentation](docs/design_choices.md).
 
 
 ## Documentation
@@ -141,6 +147,7 @@ This creates a hybrid attention mechanism that achieves both memory and computat
 
 - **[API Reference](docs/api_reference.md)** - Complete function documentation and usage examples
 - **[Integration Guide](docs/integration.md)** - Detailed technical documentation of the Flash Attention integration
+- **[Design Choices](docs/design_choices.md)** - Analysis of query-agnostic masking and its implications for different tasks
 
 
 ## Building from Source
