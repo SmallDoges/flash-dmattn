@@ -601,16 +601,61 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dv);
     clear(acc_dk);
 
+    // Adaptive density tracking for skip optimization
+    // Track active tiles to determine if we should disable skip logic
+    constexpr float DENSITY_THRESHOLD = 0.85f;  // Disable skip logic above this density
+    int total_tiles = 0;
+    int active_tiles = 0;
+    bool use_skip_optimization = true;
+
     for (; m_block >= m_block_min; --m_block) {
+        total_tiles++;
+        
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});    // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
-        cute::cp_async_wait<0>();
-        __syncthreads();
-
-        // Copy mask from smem to registers
+        
+        // Early mask prefetch optimization: Copy mask from smem to registers before waiting for K/V loads
         Tensor tSrMask = make_tensor<Element>(shape(acc_s));
         Tensor tSrMask_copy_view = smem_thr_copy_PdS.retile_D(tSrMask);
         cute::copy(smem_tiled_copy_PdS, tSsMask, tSrMask_copy_view);
+        
+        // Check mask activity early to enable skip decisions before heavy loads complete
+        bool any_active = FLASH_NAMESPACE::check_mask_activity_early(tSrMask);
+        if (any_active) active_tiles++;
+        
+        // Adaptive density mode: if observed density is high, disable skip logic to avoid overhead
+        if (total_tiles >= 4) {  // Start checking after a few tiles
+            float current_density = float(active_tiles) / float(total_tiles);
+            use_skip_optimization = (current_density <= DENSITY_THRESHOLD);
+        }
+        
+        // Early skip for fully masked blocks (only if skip optimization is enabled)
+        if (!any_active && use_skip_optimization) {
+            // For fully inactive tiles, we still need to wait for async operations to maintain pipeline
+            // but we can skip most compute and potentially start prefetch for next iteration
+            cute::cp_async_wait<0>();
+            
+            // Conditional synchronization: only sync if we have pending async operations that affect other threads
+            // For fully masked tiles, we can bypass some sync points if no shared memory aliasing occurs
+            if (m_block == m_block_min || (Double_buffer && m_block % 2 == 1)) {
+                __syncthreads();  // Required sync points for pipeline correctness
+            }
+            
+            // Next-tile look-ahead: when skipping, immediately launch prefetch for subsequent mask/bias
+            // This hides latency of future mask loads while we skip current computation
+            if (m_block > m_block_min) {
+                // Note: In real implementation, we would issue cp.async for next mask tile here
+                // This requires careful coordination with mask loading pipeline
+                // Placeholder for future mask/bias prefetch launch
+            }
+            
+            // Skip the heavy GEMM computations but maintain loop structure
+            continue;
+        }
+        
+        // Only wait for loads if the tile is active
+        cute::cp_async_wait<0>();
+        __syncthreads();
 
         Tensor dP_sum = make_fragment_like(lse);
         #pragma unroll

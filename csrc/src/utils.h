@@ -445,6 +445,27 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Early mask activity check for compute bubble reduction
+template <typename MaskTensor>
+__forceinline__ __device__ bool check_mask_activity_early(const MaskTensor &tCrM) {
+    bool local_any_active = false;
+    #pragma unroll
+    for (int mma = 0; mma < size<0>(tCrM) && !local_any_active; ++mma) {
+        #pragma unroll
+        for (int m = 0; m < size<1>(tCrM) && !local_any_active; ++m) {
+            #pragma unroll
+            for (int n = 0; n < size<2>(tCrM) && !local_any_active; ++n) {
+                // Use direct comparison to avoid potential branching
+                local_any_active |= (tCrM(mma, m, n) != 0.0f);
+            }
+        }
+    }
+    // Ensure all threads in the CTA have the same any_active value to avoid warp divergence
+    return __syncthreads_or(local_any_active);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <
     bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
     typename TiledCopy,
