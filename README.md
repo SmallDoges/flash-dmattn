@@ -99,8 +99,8 @@ if seq_len > keep_window_size:
     attention_mask.zero_()
     attention_mask.scatter(-1, topk_indices, 1.0)
 
-# Select backend
-flash_dmattn_func = flash_dmattn_func_auto(backend="cuda")
+# Select backend (auto-selects the best available backend)
+flash_dmattn_func = flash_dmattn_func_auto()  # Automatically chooses CUDA, Triton, or Flex
 
 # Run Flash Dynamic Mask Attention
 output = flash_dmattn_func(
@@ -232,12 +232,40 @@ python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 ```python
 # Test basic import
 try:
-    from flash_dmattn import flash_dmattn_func, get_available_backends
+    from flash_dmattn import flash_dmattn_func_auto, get_available_backends
     print("✅ Flash Dynamic Mask Attention imported successfully")
     print(f"Available backends: {get_available_backends()}")
+    
+    # Test auto backend selection (recommended)
+    func = flash_dmattn_func_auto()
+    print("✅ Auto backend selection works")
 except ImportError as e:
     print(f"❌ Import failed: {e}")
     print("Please ensure the package is properly installed with: pip install -e .")
+except RuntimeError as e:
+    print(f"❌ Backend error: {e}")
+    # The error message will provide specific guidance on what to install
+```
+
+**CUDA Extension Issues**
+```python
+# If you get "CUDA flash_dmattn_func is not available" error:
+# This usually means the CUDA extension was partially installed
+
+# Solution 1: Rebuild the CUDA extension
+# pip install -e . --force-reinstall
+
+# Solution 2: Use alternative backends
+# pip install triton  # For Triton backend
+# pip install transformers  # For Flex backend
+
+# Test with fallback backends
+from flash_dmattn import flash_dmattn_func_auto
+try:
+    func = flash_dmattn_func_auto()  # Will auto-select working backend
+    print("✅ Using backend:", func.__name__)
+except RuntimeError as e:
+    print(f"❌ No backends available: {e}")
 ```
 
 **Performance Issues**
