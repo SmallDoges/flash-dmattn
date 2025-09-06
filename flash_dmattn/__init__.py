@@ -66,7 +66,18 @@ __all__ = [
     "TRITON_AVAILABLE",
     "FLEX_AVAILABLE",
     "CUDA_AVAILABLE",
+    # KV Cache Optimization
+    "LinearKVCache",
+    "linear_kv_cache_attention",
 ]
+
+
+# Import KV cache optimization
+try:
+    from .kv_cache_optimizer import LinearKVCache, linear_kv_cache_attention
+except ImportError:
+    LinearKVCache = None
+    linear_kv_cache_attention = None
 
 
 def get_available_backends():
