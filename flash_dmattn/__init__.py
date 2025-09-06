@@ -69,10 +69,15 @@ __all__ = [
 ]
 
 
+def _is_cuda_fully_available():
+    """Check if CUDA backend is fully available (both module and functions)."""
+    return CUDA_AVAILABLE and flash_dmattn_func is not None
+
+
 def get_available_backends():
     """Return a list of available backends."""
     backends = []
-    if CUDA_AVAILABLE:
+    if _is_cuda_fully_available():
         backends.append("cuda")
     if TRITON_AVAILABLE:
         backends.append("triton")
@@ -94,21 +99,28 @@ def flash_dmattn_func_auto(backend: Optional[str] = None, **kwargs):
         The attention function for the specified or auto-selected backend.
     """
     if backend is None:
-        # Auto-select backend
-        if CUDA_AVAILABLE:
+        # Auto-select backend - use the first fully working backend
+        if _is_cuda_fully_available():
             backend = "cuda"
         elif TRITON_AVAILABLE:
             backend = "triton"
         elif FLEX_AVAILABLE:
             backend = "flex"
         else:
-            raise RuntimeError("No flash attention backend is available. Please install at least one of: triton, transformers, or build the CUDA extension.")
+            # Provide helpful error message based on what's partially available
+            error_parts = ["No flash attention backend is fully available."]
+            if CUDA_AVAILABLE and flash_dmattn_func is None:
+                error_parts.append("CUDA extension was found but interface functions are not available - please rebuild the CUDA extension with: pip install -e .")
+            else:
+                error_parts.append("CUDA extension is not built - please install with: pip install -e .")
+            error_parts.append("Alternatively, install alternative backends: pip install triton (for Triton backend) or pip install transformers (for Flex backend).")
+            raise RuntimeError(" ".join(error_parts))
     
     if backend == "cuda":
         if not CUDA_AVAILABLE:
-            raise RuntimeError("CUDA backend is not available. Please build the CUDA extension.")
+            raise RuntimeError("CUDA backend is not available. Please build the CUDA extension with: pip install -e .")
         if flash_dmattn_func is None:
-            raise RuntimeError("CUDA flash_dmattn_func is not available. Please check the installation.")
+            raise RuntimeError("CUDA extension was found but interface functions are not available. This may indicate an incomplete installation. Please rebuild the CUDA extension with: pip install -e .")
         return flash_dmattn_func
     
     elif backend == "triton":
