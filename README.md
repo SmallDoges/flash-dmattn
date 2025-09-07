@@ -214,6 +214,29 @@ The integration happens at the CUDA kernel level with several key components:
 
 This creates a hybrid attention mechanism that achieves both memory and computational efficiency for long sequences.
 
+### Efficient Attention Mask Handling
+
+**Q: How does Flash-DMA handle very long sequences without allocating large `[L, L]` attention masks?**
+
+Flash-DMA avoids the memory overhead of large attention matrices through **dynamic sparse masking**:
+
+1. **Learned Sparsity**: Uses importance scores to select only the top-K most relevant keys per query
+2. **Memory Efficiency**: Reduces from O(L²) to O(L·K) where K ≪ L (typically K=2048 for any L)
+3. **Quality Preservation**: Maintains attention quality by learning which positions are most important
+
+```python
+# Example: 32K sequence length with only 2K attention per query
+seq_len = 32768  # 32K tokens
+keep_window_size = 2048  # Only attend to top 2K keys per query
+
+# Memory usage comparison:
+# Dense attention: 32768² × 2 bytes = 2.1 GB per head
+# Flash-DMA: maintains O(seq_len) memory regardless of sequence length
+# Computation: reduced by ~94% (2048/32768) while preserving quality
+```
+
+See the [API Reference](docs/api_reference.md#efficient-handling-of-attention-masks-for-long-sequences) for detailed examples and [Integration Guide](docs/integration.md#memory-efficiency-for-long-sequences) for technical details.
+
 
 ## Documentation
 
