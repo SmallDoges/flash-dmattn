@@ -462,7 +462,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // Scale attention scores and apply mask/bias
             mask.template apply_mask<Is_causal, Is_even_MN>(
                 acc_s, tSrMask, tSrBias, params.scale_softmax,
-                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16,
+                params
             );
 
             FLASH_NAMESPACE::cp_async_wait<0>();
@@ -585,7 +586,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // Scale attention scores and apply dynamic mask
             mask.template apply_mask</*Causal_mask=*/false>(
                 acc_s, tSrMask, tSrBias, params.scale_softmax,
-                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16,
+                params
             );
 
             FLASH_NAMESPACE::cp_async_wait<0>();
@@ -1122,7 +1124,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             // Scale attention scores and apply dynamic mask
             mask.template apply_mask<Is_causal, Is_even_MN>(
                 acc_s, tSrMask, tSrBias, params.scale_softmax,
-                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16,
+                params
             );
 
             FLASH_NAMESPACE::cp_async_wait<0>();
@@ -1265,7 +1268,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             // Scale attention scores and apply dynamic mask
             mask.template apply_mask</*Causal_mask=*/false>(
                 acc_s, tSrMask, tSrBias, params.scale_softmax,
-                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+                n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16,
+                params
             );
 
             FLASH_NAMESPACE::cp_async_wait<0>();

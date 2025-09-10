@@ -49,7 +49,9 @@ void set_params_fprop(
     bool is_causal,
     const float softcap,
     bool seqlenq_ngroups_swapped=false,
-    const bool unpadded_lse=false
+    const bool unpadded_lse=false,
+    const bool use_mask=true,
+    const bool use_bias=true
 ) {
 
     // Reset the parameters
@@ -130,6 +132,8 @@ void set_params_fprop(
     }
 
     params.is_causal = is_causal;
+    params.use_mask = use_mask;
+    params.use_bias = use_bias;
     params.is_seqlens_k_cumulative = true;
 
     #ifdef FLASHATTENTION_DISABLE_UNEVEN_K
@@ -175,7 +179,9 @@ void set_params_dgrad(
     bool is_causal,
     const float softcap,
     bool deterministic,
-    const bool unpadded_lse
+    const bool unpadded_lse,
+    const bool use_mask=true,
+    const bool use_bias=true
 ) {
     set_params_fprop(
         params,
@@ -190,7 +196,9 @@ void set_params_dgrad(
         is_causal,
         softcap,
         false,  // seqlenq_ngroups_swapped
-        unpadded_lse
+        unpadded_lse,
+        use_mask,
+        use_bias
     );
 
     // Set the pointers and strides.
@@ -347,7 +355,9 @@ mha_fwd(
     const float softmax_scale,
     bool is_causal,
     const float softcap,
-    const bool return_softmax
+    const bool return_softmax,
+    const bool use_mask = true,
+    const bool use_bias = true
 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -454,7 +464,11 @@ mha_fwd(
         softmax_lse.data_ptr(),
         softmax_scale,
         is_causal,
-        softcap
+        softcap,
+        seqlenq_ngroups_swapped,
+        /*unpadded_lse=*/false,
+        use_mask,
+        use_bias
     );
 
     // Keep references to these tensors to extend their lifetime
@@ -500,7 +514,9 @@ mha_varlen_fwd(
     const bool zero_tensors,
     bool is_causal,
     const float softcap,
-    const bool return_softmax
+    const bool return_softmax,
+    const bool use_mask = true,
+    const bool use_bias = true
 ) {
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -649,7 +665,9 @@ mha_varlen_fwd(
         is_causal,
         softcap,
         seqlenq_ngroups_swapped,
-        /*unpadded_lse*/true
+        /*unpadded_lse*/true,
+        use_mask,
+        use_bias
     );
     params.total_q = total_q;
 
@@ -729,7 +747,9 @@ mha_bwd(
     const float softmax_scale,
     const bool is_causal,
     const float softcap,
-    const bool deterministic
+    const bool deterministic,
+    const bool use_mask = true,
+    const bool use_bias = true
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -883,7 +903,9 @@ mha_bwd(
         is_causal,
         softcap,
         deterministic,
-        /*unpadded_lse*/false
+        /*unpadded_lse*/false,
+        use_mask,
+        use_bias
     );
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
@@ -931,7 +953,9 @@ mha_varlen_bwd(
     const bool zero_tensors,
     const bool is_causal,
     const float softcap,
-    const bool deterministic
+    const bool deterministic,
+    const bool use_mask = true,
+    const bool use_bias = true
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1104,7 +1128,9 @@ mha_varlen_bwd(
         is_causal,
         softcap,
         deterministic,
-        /*unpadded_lse*/true
+        /*unpadded_lse*/true,
+        use_mask,
+        use_bias
     );
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
     params.total_q = total_q;
