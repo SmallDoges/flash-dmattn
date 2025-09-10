@@ -11,7 +11,7 @@ namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
-template <bool Causal_mask=false, typename TensorType, typename MaskType, typename BiasType>
+template <bool Causal_mask=false, typename TensorType, typename MaskType, typename BiasType, typename Params>
 __forceinline__ __device__ void apply_mask(
     TensorType &tensor,
     MaskType &mask,
@@ -21,7 +21,8 @@ __forceinline__ __device__ void apply_mask(
     const int max_seqlen_k,
     const int row_idx_offset,
     const int max_seqlen_q,
-    const int warp_row_stride
+    const int warp_row_stride,
+    const Params &params
 ) {
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(TensorType::rank == 2, "Only support 2D Tensor");
@@ -44,10 +45,30 @@ __forceinline__ __device__ void apply_mask(
                     const int col_idx = col_idx_base + j;
                     // Without the "make_coord" we get wrong results
                     auto coord = make_coord(make_coord(i, mi), make_coord(j, nj));
-                    // Apply scaling and bias or masking
-                    tensor(coord) = (col_idx >= col_idx_limit) || (mask(coord) == 0.0f)
+                    
+                    // Conditional mask and bias application
+                    bool is_masked = false;
+                    float bias_val = 0.0f;
+                    
+                    // Apply causal mask or boundary check
+                    if (col_idx >= col_idx_limit) {
+                        is_masked = true;
+                    }
+                    
+                    // Apply mask if enabled
+                    if (params.use_mask && mask(coord) == 0.0f) {
+                        is_masked = true;
+                    }
+                    
+                    // Add bias if enabled
+                    if (params.use_bias) {
+                        bias_val = bias(coord);
+                    }
+                    
+                    // Apply scaling and bias or set to -INFINITY if masked
+                    tensor(coord) = is_masked 
                         ? -INFINITY
-                        : tensor(coord) * scale_softmax + bias(coord);
+                        : tensor(coord) * scale_softmax + bias_val;
                 }
             }
         }
@@ -66,7 +87,7 @@ struct Mask {
         , max_seqlen_q(max_seqlen_q) {
     };
 
-    template <bool Causal_mask=false, bool Is_even_MN=true, typename TensorType, typename MaskType, typename BiasType>
+    template <bool Causal_mask=false, bool Is_even_MN=true, typename TensorType, typename MaskType, typename BiasType, typename Params>
     __forceinline__ __device__ void apply_mask(
         TensorType &tensor_,                        // acc_s (attention scores, MMA=4, MMA_M, MMA_N)
         MaskType &tSrMask,                          // Attention Mask (MMA=4, MMA_M, MMA_N)
@@ -74,7 +95,8 @@ struct Mask {
         const float scale_softmax,                  // Scale for softmax
         const int col_idx_offset_,                  // Column index offset
         const int row_idx_offset,                   // Row index offset
-        const int warp_row_stride                   // Warp row stride
+        const int warp_row_stride,                  // Warp row stride
+        const Params &params                        // Parameters containing use_mask and use_bias flags
     ) {
         static_assert(TensorType::rank == 3, "tensor_ must be 3D Tensor");
         static_assert(MaskType::rank == 3, "Mask must be 3D Tensor");
@@ -104,10 +126,30 @@ struct Mask {
                     for (int j = 0; j < size<1, 0>(tensor); ++j) {
                         const int col_idx = col_idx_base + j;
                         auto coord = make_coord(make_coord(i, mi), make_coord(j, nj));
-                        // Apply scaling and bias or masking
-                        tensor(coord) = (col_idx >= col_idx_limit) || (mask(coord) == 0.0f)
+                        
+                        // Conditional mask and bias application
+                        bool is_masked = false;
+                        float bias_val = 0.0f;
+                        
+                        // Apply causal mask or boundary check
+                        if (col_idx >= col_idx_limit) {
+                            is_masked = true;
+                        }
+                        
+                        // Apply mask if enabled
+                        if (params.use_mask && mask(coord) == 0.0f) {
+                            is_masked = true;
+                        }
+                        
+                        // Add bias if enabled
+                        if (params.use_bias) {
+                            bias_val = bias(coord);
+                        }
+                        
+                        // Apply scaling and bias or set to -INFINITY if masked
+                        tensor(coord) = is_masked 
                             ? -INFINITY
-                            : tensor(coord) * scale_softmax + bias(coord);
+                            : tensor(coord) * scale_softmax + bias_val;
                     }
                 }
             }

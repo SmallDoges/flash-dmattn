@@ -682,7 +682,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 binfo.actual_seqlen_k,
                 m_block * kBlockM + get<0>(taccScS_row(0)),
                 binfo.actual_seqlen_q,
-                AtomLayoutMS * 16
+                AtomLayoutMS * 16,
+                params
             );
 
             // if (cute::thread(32, 0)) { print(scores); }
@@ -776,14 +777,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             Tensor tdSadS = smem_thr_copy_PdS.retile_S(tdSrdS);     // ((Atom, AtomNum), MMA_M, MMA_N)
             cute::copy(smem_tiled_copy_PdS, tdSadS, tdSsdS);
             __syncthreads();
-            // Write dS to dBias
-            FLASH_NAMESPACE::copy_MN<Is_even_MN, /*Clear_OOB_MN=*/false>(
-                gmem_tiled_copy_MaskBias,
-                tBiassBias, tdBiasgdBias,
-                tBiascBias,
-                binfo.actual_seqlen_q - m_block * kBlockM,
-                binfo.actual_seqlen_k - n_block * kBlockN
-            );
+            // Write dS to dBias (only if bias is used)
+            if (params.use_bias) {
+                FLASH_NAMESPACE::copy_MN<Is_even_MN, /*Clear_OOB_MN=*/false>(
+                    gmem_tiled_copy_MaskBias,
+                    tBiassBias, tdBiasgdBias,
+                    tBiascBias,
+                    binfo.actual_seqlen_q - m_block * kBlockM,
+                    binfo.actual_seqlen_k - n_block * kBlockN
+                );
+            }
 
             // if (cute::thread0()) { print(tPrP); }
             // Layout p_l = tPrP.layout();
@@ -919,8 +922,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         if (m_block > m_block_min) {
             // Advance gBias and gdBias
-            tBiasgBias.data() = tBiasgBias.data() + (-int(kBlockM * params.bias_row_stride));
-            tdBiasgdBias.data() = tdBiasgdBias.data() + (-int(kBlockM * params.dbias_row_stride));
+            if (params.use_bias) {
+                tBiasgBias.data() = tBiasgBias.data() + (-int(kBlockM * params.bias_row_stride));
+                tdBiasgdBias.data() = tdBiasgdBias.data() + (-int(kBlockM * params.dbias_row_stride));
+            }
             if (any_active_next) {
                 FLASH_NAMESPACE::copy_MN<Is_even_MN, /*Clear_OOB_MN=*/true>(
                     gmem_tiled_copy_MaskBias,
