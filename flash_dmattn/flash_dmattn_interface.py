@@ -80,7 +80,9 @@ def _flash_dmattn_forward(
     softmax_scale: float,
     is_causal: bool,
     softcap: float,
-    return_softmax: bool
+    return_softmax: bool,
+    use_mask: bool,
+    use_bias: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, mask, bias = [maybe_contiguous(x) for x in (q, k, v, mask, bias)]
     out, softmax_lse, S_dmask = flash_dmattn_gpu.fwd(
@@ -94,6 +96,8 @@ def _flash_dmattn_forward(
         is_causal,
         softcap,
         return_softmax,
+        use_mask,
+        use_bias,
     )
     _sanitize_tensors(out)
     return out, softmax_lse, S_dmask
@@ -109,7 +113,9 @@ def _flash_dmattn_forward_fake(
     softmax_scale: float,
     is_causal: bool,
     softcap: float,
-    return_softmax: bool
+    return_softmax: bool,
+    use_mask: bool,
+    use_bias: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, mask, bias = [maybe_contiguous(x) for x in (q, k, v, mask, bias)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
@@ -145,6 +151,8 @@ def _flash_dmattn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    use_mask: bool = True,
+    use_bias: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, mask, bias = [maybe_contiguous(x) for x in (q, k, v, mask, bias)]
     out, softmax_lse, S_dmask = flash_dmattn_gpu.varlen_fwd(
@@ -166,6 +174,8 @@ def _flash_dmattn_varlen_forward(
         is_causal,
         softcap,
         return_softmax,
+        use_mask,
+        use_bias,
     )
     _sanitize_tensors(out)
     return out, softmax_lse, S_dmask
@@ -190,6 +200,8 @@ def _flash_dmattn_varlen_forward_fake(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    use_mask: bool = True,
+    use_bias: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, mask, bias = [maybe_contiguous(x) for x in (q, k, v, mask, bias)]
     paged_kv = block_table is not None
@@ -227,6 +239,8 @@ def _flash_dmattn_backward(
     is_causal: bool,
     softcap: float,
     deterministic: bool,
+    use_mask: bool,
+    use_bias: bool,
 ) -> torch.Tensor:
     dout, dbias, q, k, v, mask, bias, out = [maybe_contiguous(x) for x in (dout, dbias, q, k, v, mask, bias, out)]
     (
@@ -252,6 +266,8 @@ def _flash_dmattn_backward(
         is_causal,
         softcap,
         deterministic,
+        use_mask,
+        use_bias,
     )
     _sanitize_tensors(dq, dk, dv, dbias)
     return softmax_d
@@ -275,6 +291,8 @@ def _flash_dmattn_backward_fake(
     is_causal: bool,
     softcap: float,
     deterministic: bool,
+    use_mask: bool,
+    use_bias: bool,
 ) -> torch.Tensor:
     dout, dbias, q, k, v, mask, bias, out = [maybe_contiguous(x) for x in (dout, dbias, q, k, v, mask, bias, out)]
     if dq is None:
@@ -317,6 +335,8 @@ def _flash_dmattn_varlen_backward(
     softcap: float,
     deterministic: bool,
     zero_tensors: bool = False,
+    use_mask: bool = True,
+    use_bias: bool = True,
 ) -> torch.Tensor:
     dout, dbias, q, k, v, mask, bias, out = [maybe_contiguous(x) for x in (dout, dbias, q, k, v, mask, bias, out)]
     (
@@ -347,6 +367,8 @@ def _flash_dmattn_varlen_backward(
         is_causal,
         softcap,
         deterministic,
+        use_mask,
+        use_bias,
     )
     _sanitize_tensors(dq, dk, dv, dbias)
     return softmax_d
@@ -375,6 +397,8 @@ def _flash_dmattn_varlen_backward_fake(
     softcap: float,
     deterministic: bool,
     zero_tensors: bool = False,
+    use_mask: bool = True,
+    use_bias: bool = True,
 ) -> torch.Tensor:
     dout, dbias, q, k, v, mask, bias, out = [maybe_contiguous(x) for x in (dout, dbias, q, k, v, mask, bias, out)]
     batch_size = cu_seqlens_q.numel() - 1
@@ -418,11 +442,16 @@ class FlashDMAttnFunc(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
-        if mask is None:
+        
+        # Determine which tensors are actually provided
+        use_mask = mask is not None
+        use_bias = bias is not None
+        return_dbias = use_bias
+        
+        # Create dummy tensors for the CUDA kernel if needed (will be ignored based on flags)
+        if not use_mask:
             mask = torch.ones((batch_size, num_heads_k, seqlen_q, seqlen_k), dtype=q.dtype, device=q.device)
-        return_dbias = True
-        if bias is None:
-            return_dbias = False
+        if not use_bias:
             bias = torch.zeros((batch_size, num_heads_k, seqlen_q, seqlen_k), dtype=q.dtype, device=q.device)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -458,6 +487,8 @@ class FlashDMAttnFunc(torch.autograd.Function):
             is_causal=is_causal,
             softcap=softcap,
             return_softmax=return_softmax,
+            use_mask=use_mask,
+            use_bias=use_bias,
         )
 
         if is_grad:
@@ -468,6 +499,8 @@ class FlashDMAttnFunc(torch.autograd.Function):
             ctx.softcap = softcap
             ctx.deterministic = deterministic
             ctx.return_dbias = return_dbias
+            ctx.use_mask = use_mask
+            ctx.use_bias = use_bias
 
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
@@ -503,6 +536,8 @@ class FlashDMAttnFunc(torch.autograd.Function):
             ctx.is_causal,
             ctx.softcap,
             ctx.deterministic,
+            ctx.use_mask,
+            ctx.use_bias,
         )
 
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -514,8 +549,8 @@ class FlashDMAttnFunc(torch.autograd.Function):
             dv = dv[:, : ctx.seqlen_k, :, :]
             dbias = dbias[..., : ctx.seqlen_k]
         if ctx.return_dbias:
-            return dq, dk, dv, None, dbias, None, None, None, None, None, None
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+            return dq, dk, dv, None, dbias, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashDMAttnVarlenFunc(torch.autograd.Function):
@@ -547,12 +582,16 @@ class FlashDMAttnVarlenFunc(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
-        if mask is None:
+        # Determine which tensors are actually provided
+        use_mask = mask is not None
+        use_bias = bias is not None
+        return_dbias = use_bias
+        
+        # Create dummy tensors for the CUDA kernel if needed (will be ignored based on flags)
+        if not use_mask:
             mask = torch.ones((total_q, num_heads_k, max_seqlen_k), dtype=q.dtype, device=q.device)
-        return_dbias = True
-        if bias is None:
+        if not use_bias:
             bias = torch.zeros((total_q, num_heads_k, max_seqlen_k), dtype=q.dtype, device=q.device)
-            return_dbias = False
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         if is_causal is None:
@@ -599,6 +638,8 @@ class FlashDMAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
             return_softmax=return_softmax,
             block_table=block_table,
+            use_mask=use_mask,
+            use_bias=use_bias,
         )
 
         if is_grad:
@@ -614,6 +655,8 @@ class FlashDMAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap = softcap
             ctx.deterministic = deterministic
             ctx.return_dbias = return_dbias
+            ctx.use_mask = use_mask
+            ctx.use_bias = use_bias
 
         out = out_padded[..., :head_size_og]
         if return_softmax:
@@ -657,6 +700,8 @@ class FlashDMAttnVarlenFunc(torch.autograd.Function):
             ctx.is_causal,
             ctx.softcap,
             ctx.deterministic,
+            use_mask=ctx.use_mask,
+            use_bias=ctx.use_bias,
         )
 
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
@@ -667,8 +712,8 @@ class FlashDMAttnVarlenFunc(torch.autograd.Function):
             dbias = dbias[:, :, :ctx.seqlen_k_og]
 
         if ctx.return_dbias:
-            return dq, dk, dv, None, dbias, None, None, None, None, None, None, None, None, None, None, None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
+            return dq, dk, dv, None, dbias, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_dmattn_func(
