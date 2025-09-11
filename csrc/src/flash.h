@@ -136,6 +136,9 @@ struct Flash_fwd_params : public QKV_params, public Mask_params, public Bias_par
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+    
+    // Unified sparse mask for advanced masking strategies
+    void * __restrict__ sparse_mask_ptr;  // Pointer to UnifiedSparseMask object
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
