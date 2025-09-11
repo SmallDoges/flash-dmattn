@@ -16,6 +16,8 @@
 #include "utils.h"
 #include "softmax.h"
 #include "mask.h"
+#include "unified_sparse_mask.h"
+#include "mask_factory.h"
 
 namespace FLASH_NAMESPACE {
 

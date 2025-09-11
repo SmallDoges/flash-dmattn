@@ -4,6 +4,7 @@
 
 #pragma once
 #include "namespace_config.h"
+#include "unified_sparse_mask.h"
 
 #include <cute/tensor.hpp>
 
@@ -57,14 +58,65 @@ __forceinline__ __device__ void apply_mask(
 template <bool Is_causal>
 struct Mask {
     const int max_seqlen_k, max_seqlen_q;
-
+    const UnifiedSparseMask* sparse_mask; // Optional unified sparse mask
+    
     __forceinline__ __device__ Mask(
         const int max_seqlen_k,
-        const int max_seqlen_q
+        const int max_seqlen_q,
+        const UnifiedSparseMask* sparse_mask_ptr = nullptr
     )  // Constructor
         : max_seqlen_k(max_seqlen_k)
-        , max_seqlen_q(max_seqlen_q) {
+        , max_seqlen_q(max_seqlen_q)
+        , sparse_mask(sparse_mask_ptr) {
     };
+
+    // New unified mask application with block-level skipping
+    template <bool Causal_mask=false, bool Is_even_MN=true, typename TensorType, typename MaskType, typename BiasType>
+    __forceinline__ __device__ bool apply_mask_with_skip_check(
+        TensorType &tensor_,                        // acc_s (attention scores, MMA=4, MMA_M, MMA_N)
+        MaskType &tSrMask,                          // Attention Mask (MMA=4, MMA_M, MMA_N)
+        BiasType &tSrBias,                          // Attention Bias (MMA=4, MMA_M, MMA_N)
+        const float scale_softmax,                  // Scale for softmax
+        const int col_idx_offset_,                  // Column index offset
+        const int row_idx_offset,                   // Row index offset
+        const int warp_row_stride,                  // Warp row stride
+        const int query_block_idx,                  // Query block index for sparse mask
+        const int key_block_idx,                    // Key block index for sparse mask
+        const int block_size_m = 128,              // Block size M
+        const int block_size_n = 128               // Block size N
+    ) {
+        static_assert(TensorType::rank == 3, "tensor_ must be 3D Tensor");
+        static_assert(MaskType::rank == 3, "Mask must be 3D Tensor");
+        static_assert(BiasType::rank == 3, "Bias must be 3D Tensor");
+        static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+
+        // Step 1: Check if we should skip this block entirely using unified sparse mask
+        bool any_active = true;
+        if (sparse_mask != nullptr) {
+            any_active = sparse_mask->is_block_active(query_block_idx, key_block_idx);
+            if (!any_active) {
+                // Block is completely masked - skip all computation
+                return false;
+            }
+        }
+
+        // Step 2: Apply traditional mask logic for active blocks
+        apply_mask<Causal_mask, Is_even_MN>(
+            tensor_, tSrMask, tSrBias, scale_softmax,
+            col_idx_offset_, row_idx_offset, warp_row_stride
+        );
+
+        // Step 3: If we have a unified sparse mask, perform more detailed activity check
+        if (sparse_mask != nullptr) {
+            // For non-parametric masks, do OR reduction on the actual mask tile
+            MaskType mask_type = sparse_mask->get_mask_type();
+            if (mask_type != MaskType::PARAMETRIC_CAUSAL && mask_type != MaskType::PARAMETRIC_WINDOW) {
+                any_active = sparse_mask->compute_block_activity_fast(tSrMask, query_block_idx, key_block_idx);
+            }
+        }
+
+        return any_active;
+    }
 
     template <bool Causal_mask=false, bool Is_even_MN=true, typename TensorType, typename MaskType, typename BiasType>
     __forceinline__ __device__ void apply_mask(

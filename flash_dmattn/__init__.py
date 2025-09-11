@@ -29,6 +29,27 @@ except ImportError:
     FLEX_AVAILABLE = False
     flex_dmattn_func = None
 
+# Import Sparse Mask API
+try:
+    from flash_dmattn.sparse_mask import (
+        SparseMask, CausalMask, WindowMask, CausalWindowMask, 
+        BlockBitsetMask, BCSRMask, DynamicMask, create_sparse_mask,
+        estimate_speedup, calculate_memory_savings
+    )
+    SPARSE_MASK_AVAILABLE = True
+except ImportError:
+    SPARSE_MASK_AVAILABLE = False
+    SparseMask = None
+    CausalMask = None
+    WindowMask = None
+    CausalWindowMask = None
+    BlockBitsetMask = None
+    BCSRMask = None
+    DynamicMask = None
+    create_sparse_mask = None
+    estimate_speedup = None
+    calculate_memory_savings = None
+
 
 def get_available_backends():
     """Return a list of available backends."""
@@ -86,11 +107,23 @@ def flash_dmattn_func_auto(backend: Optional[str] = None, **kwargs):
 
 __all__ = [
     "CUDA_AVAILABLE",
-    "TRITON_AVAILABLE",
+    "TRITON_AVAILABLE", 
     "FLEX_AVAILABLE",
+    "SPARSE_MASK_AVAILABLE",
     "flash_dmattn_func",
     "triton_dmattn_func",
     "flex_dmattn_func",
     "get_available_backends",
     "flash_dmattn_func_auto",
+    # Sparse Mask API
+    "SparseMask",
+    "CausalMask",
+    "WindowMask", 
+    "CausalWindowMask",
+    "BlockBitsetMask",
+    "BCSRMask",
+    "DynamicMask",
+    "create_sparse_mask",
+    "estimate_speedup",
+    "calculate_memory_savings",
 ]

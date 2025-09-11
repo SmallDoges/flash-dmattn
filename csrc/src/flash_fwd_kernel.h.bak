@@ -396,16 +396,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     clear(acc_o);
 
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
-    // Init dynamic mask processor with optional unified sparse mask (first instance)
-    const UnifiedSparseMask* sparse_mask_ptr = nullptr;
-    // Check if unified sparse mask is provided in params
-    if (params.sparse_mask_ptr != nullptr) {
-        sparse_mask_ptr = static_cast<const UnifiedSparseMask*>(params.sparse_mask_ptr);
-    }
-    
+
+    // Init dynamic mask processor
     FLASH_NAMESPACE::Mask<Is_causal> mask(
-        binfo.actual_seqlen_k, binfo.actual_seqlen_q, sparse_mask_ptr
-    );
         binfo.actual_seqlen_k, binfo.actual_seqlen_q
     );
 
@@ -1063,15 +1056,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     // Init dynamic mask processor
-    // Init dynamic mask processor with optional unified sparse mask (second instance)
-    const UnifiedSparseMask* sparse_mask_ptr2 = nullptr;
-    // Check if unified sparse mask is provided in params
-    if (params.sparse_mask_ptr != nullptr) {
-        sparse_mask_ptr2 = static_cast<const UnifiedSparseMask*>(params.sparse_mask_ptr);
-    }
-    
     FLASH_NAMESPACE::Mask<Is_causal> mask(
-        binfo.actual_seqlen_k, binfo.actual_seqlen_q, sparse_mask_ptr2
+        binfo.actual_seqlen_k, binfo.actual_seqlen_q
     );
 
     // For performance reason, we separate out two kinds of iterations:
