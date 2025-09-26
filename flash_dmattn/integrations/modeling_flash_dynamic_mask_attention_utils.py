@@ -65,7 +65,14 @@ def _flash_dynamic_mask_attention_forward(
     **kwargs,
 ):
     dtype = query_states.dtype
-    min_dtype = torch.finfo(dtype).min
+    # Use a safer minimum value for masking to prevent INF in bf16 conversion
+    # The original torch.finfo(dtype).min can be too extreme for CUDA kernels
+    if dtype == torch.bfloat16:
+        min_dtype = -1e30  # Large negative but safe for bf16 conversion
+    elif dtype == torch.float16:
+        min_dtype = -1e4   # Safe for f16 conversion
+    else:
+        min_dtype = torch.finfo(dtype).min  # f32 can handle extreme values
     batch_size, _, num_kv_heads, _ = key_states.shape
 
     if not all(k in globals() for k in ("_flash_fn")):

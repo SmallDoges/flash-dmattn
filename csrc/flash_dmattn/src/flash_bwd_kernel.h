@@ -845,8 +845,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         if (any_active) {
             // Tensor dS_reshaped = make_tensor(dS.data(), acc_dp.layout());
-            // Convert dS from fp32 to fp16
-            Tensor tdSrdS = FLASH_NAMESPACE::convert_type<Element>(acc_dp);
+            // Convert dS from fp32 to fp16/bf16 with safe clamping to prevent inf/nan
+            Tensor tdSrdS = FLASH_NAMESPACE::convert_type_safe<Element>(acc_dp);
             Tensor tdSadS = smem_thr_copy_PdS.retile_S(tdSrdS);     // ((Atom, AtomNum), MMA_M, MMA_N)
             cute::copy(smem_tiled_copy_PdS, tdSadS, tdSsdS);
             __syncthreads();
