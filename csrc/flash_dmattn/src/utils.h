@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <cmath>
 
 #include <cuda_fp16.h>
 
@@ -403,6 +404,40 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
     cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
     // HACK: this requires tensor to be "contiguous"
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+}
+
+// Safe conversion function that clamps values to prevent inf/nan in bf16/f16
+template <typename To_type, typename Engine, typename Layout>
+__forceinline__ __device__ auto convert_type_safe(Tensor<Engine, Layout> const &tensor) {
+    using From_type = typename Engine::value_type;
+    static_assert(std::is_same_v<From_type, float>);
+    static_assert(std::is_same_v<To_type, cutlass::half_t> || std::is_same_v<To_type, cutlass::bfloat16_t>);
+    
+    constexpr int numel = decltype(size(tensor))::value;
+    
+    // Define safe clamping bounds for bf16/f16 conversion
+    constexpr float max_safe_val = std::is_same_v<To_type, cutlass::half_t> ? 65504.0f : 3.3895e+38f * 0.5f;  // Use half of max for safety
+    constexpr float min_safe_val = -max_safe_val;
+    
+    // Create a copy of the tensor data with clamped values
+    cutlass::Array<From_type, numel> clamped_data;
+    const auto* input_data = reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data());
+    
+    #pragma unroll
+    for (int i = 0; i < numel; ++i) {
+        float val = (*input_data)[i];
+        // Clamp inf/nan and extreme values to safe range
+        if (!isfinite(val) || val > max_safe_val) {
+            val = max_safe_val;
+        } else if (val < min_safe_val) {
+            val = min_safe_val;
+        }
+        clamped_data[i] = val;
+    }
+    
+    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+    auto frag = convert_op(clamped_data);
     return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
