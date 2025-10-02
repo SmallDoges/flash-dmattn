@@ -25,6 +25,17 @@ import argparse
 import time
 import gc
 import sys
+import os
+from typing import Optional
+import numpy as np
+
+try:
+    import colorama
+
+    colorama.just_fix_windows_console()
+except ImportError:  # pragma: no cover - optional dependency
+    colorama = None
+
 
 # Import the compiled CUDA extension
 try:
@@ -55,6 +66,102 @@ except ImportError as e:
     print("Please make sure the Flex Attention implementation is available.")
     # Don't exit here, just warn
     flex_dmattn_func = None
+
+
+ANSI_RESET = "\033[0m"
+ANSI_CODES = {
+    "green": "32",
+    "yellow": "33",
+    "red": "31",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+}
+
+
+def _supports_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    stream = getattr(sys, "stdout", None)
+    return bool(stream and stream.isatty())
+
+
+ENABLE_COLOR = _supports_color()
+
+
+def style_text(text: str, color: Optional[str] = None, bold: bool = False) -> str:
+    """Apply optional ANSI styling if the current environment supports color."""
+
+    if not ENABLE_COLOR or (color is None and not bold):
+        return text
+
+    codes = []
+    if bold:
+        codes.append("1")
+    if color and color in ANSI_CODES:
+        codes.append(ANSI_CODES[color])
+
+    if not codes:
+        return text
+
+    return f"\033[{';'.join(codes)}m{text}{ANSI_RESET}"
+
+
+def format_metric_cell(status: str, value: str, success_color: str = "cyan") -> str:
+    """Color-code metric cells based on status."""
+
+    if status == "success":
+        return style_text(value, success_color)
+
+    if status in {"OOM", "Not Available"}:
+        return style_text(value, "red")
+
+    if status in {"N/A"}:
+        return style_text(value, "yellow")
+
+    return style_text(value, "yellow")
+
+
+def compute_sdpa_backward_tflops(
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    elapsed_ms: float,
+) -> float:
+    """Estimate effective TFLOPs for SDPA backward given execution time.
+
+    Utilizes the same dense attention flop model as the forward benchmark, which
+    is a reasonable lower bound for backward pass compute density."""
+
+    if elapsed_ms is None or elapsed_ms <= 0:
+        return 0.0
+
+    # Backward attention FLOPs are roughly ~2x forward matmuls; approximate as 8 * B * H * Q * K * D
+    flop_count = 8 * batch_size * num_heads * query_len * key_len * head_dim
+    return flop_count / (elapsed_ms / 1000.0) / 1e12
+
+
+def compute_dmattn_backward_tflops(
+    batch_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    keep_window_size: int,
+    elapsed_ms: float,
+) -> float:
+    """Estimate effective TFLOPs for dynamic mask attention backward kernels."""
+
+    if elapsed_ms is None or elapsed_ms <= 0:
+        return 0.0
+
+    effective_keys = min(key_len, keep_window_size)
+    # Apply same ~2x multiplier for dynamic mask (sparse) backward
+    flop_count = 8 * batch_size * num_heads * query_len * effective_keys * head_dim
+    return flop_count / (elapsed_ms / 1000.0) / 1e12
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -149,8 +256,11 @@ def scaled_dot_product_attention_backward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
+    dt_proj: torch.Tensor,
+    A: torch.Tensor,
     scaling: float,
-    causal_mask: torch.Tensor,
+    cache_position: torch.Tensor,
+    keep_window_size=2048,
     is_causal=True,
 ):
     """
@@ -167,28 +277,40 @@ def scaled_dot_product_attention_backward(
     Returns:
         tuple: (output_tensor, timing_ms) or ("OOM", 0) if out of memory
     """
-    _, _, query_len, _ = query_states.shape
-    _, _, key_len, _ = key_states.shape
-    if query_len > 32768 and key_len > 32768:
-        return "OOM", 0
+    _, num_heads, query_len, _ = query_states.shape
+    _, num_kv_heads, key_len, _ = key_states.shape
+    num_queries_per_kv = num_heads // num_kv_heads
+    
+    # Calculate zoh_states
+    zoh_states = calculate_zoh_states(value_states, dt_proj, A)
+
+    # Use prepare_dynamic_mask to get the processed attention mask
+    attn_bias, attn_mask = prepare_dynamic_mask(
+        query_states,
+        zoh_states,
+        keep_window_size,
+        cache_position if is_causal else None
+    )   # [batch_size, num_kv_heads, query_len, key_len]
 
     query_states = query_states.contiguous()
     key_states = key_states.contiguous()
     value_states = value_states.contiguous()
+    attn_bias = repeat_kv(attn_bias, num_queries_per_kv).contiguous()
 
     try:
         # Forward pass - SDPA expects q, k, v in [batch, num_heads, seq_len, head_dim] format
         attn_outputs = F.scaled_dot_product_attention(
-            query_states,                    # [batch, num_heads, query_len, head_dim]
-            key_states,                      # [batch, num_kv_heads, key_len, head_dim]
-            value_states,                    # [batch, num_kv_heads, key_len, head_dim]
-            attn_mask=causal_mask,
+            query_states,                   # [batch, num_heads, query_len, head_dim]
+            key_states,                     # [batch, num_kv_heads, key_len, head_dim]
+            value_states,                   # [batch, num_kv_heads, key_len, head_dim]
+            attn_mask=attn_bias,            # [batch, num_kv_heads, query_len, key_len]
             scale=scaling,
             # is_causal=is_causal if query_len == key_len else False,
             enable_gqa=True
         )
+
         # Transpose to match expected output format
-        attn_outputs = attn_outputs.transpose(1, 2).contiguous()  # [batch, query_len, num_heads, head_dim]
+        attn_outputs = attn_outputs.transpose(1, 2).contiguous()    # [batch, query_len, num_heads, head_dim]
         
         torch.cuda.synchronize()
         start_time = time.time()
@@ -245,7 +367,7 @@ def dynamic_mask_attention_backward_cuda(
         zoh_states,
         keep_window_size,
         cache_position if is_causal else None
-    )  # [batch_size, num_kv_heads, query_len, key_len]
+    )   # [batch_size, num_kv_heads, query_len, key_len]
     
     # Ensure correct data types and memory layout for CUDA function
     # CUDA function expects: q, k, v in [batch, seqlen, num_heads, head_dim] format
@@ -256,13 +378,13 @@ def dynamic_mask_attention_backward_cuda(
     try:
         # Call the flash_dmattn_func interface
         attn_outputs = flash_dmattn_func(
-            query=query_states,                                         # q: [batch, query_len, num_heads, head_dim]
-            key=key_states,                                             # k: [batch, key_len, num_kv_heads, head_dim]
-            value=value_states,                                         # v: [batch, key_len, num_kv_heads, head_dim]
-            attn_mask=attn_mask,                                        # mask: [batch, num_kv_heads, query_len, key_len]
-            attn_bias=attn_bias,                                        # bias: [batch, num_kv_heads, query_len, key_len]
-            is_causal=is_causal,                                        # causal masking
-            scale=scaling,                                              # scaling factor
+            query=query_states,             # q: [batch, query_len, num_heads, head_dim]
+            key=key_states,                 # k: [batch, key_len, num_kv_heads, head_dim]
+            value=value_states,             # v: [batch, key_len, num_kv_heads, head_dim]
+            attn_mask=attn_mask,            # mask: [batch, num_kv_heads, query_len, key_len]
+            attn_bias=attn_bias,            # bias: [batch, num_kv_heads, query_len, key_len]
+            is_causal=is_causal,            # causal masking
+            scale=scaling,                  # scaling factor
             softcap=0.0,
             deterministic=False,
             return_attn_probs=False
@@ -517,9 +639,13 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
     results = {
         'config': config,
         'sdpa_backward_times': [],
+        'sdpa_backward_tflops': [],
         'fdma_cuda_backward_times': [],
+        'fdma_cuda_backward_tflops': [],
         'fdma_triton_backward_times': [],
+        'fdma_triton_backward_tflops': [],
         'fdma_flex_backward_times': [],
+        'fdma_flex_backward_tflops': [],
         'sdpa_backward_memory': 0,
         'fdma_cuda_backward_memory': 0,
         'fdma_triton_backward_memory': 0,
@@ -547,9 +673,12 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
             q_clone = query_states.clone().detach().requires_grad_(True)
             k_clone = key_states.clone().detach().requires_grad_(True)
             v_clone = value_states.clone().detach().requires_grad_(True)
+            dt_clone = dt_proj.clone().detach().requires_grad_(True)
+            a_clone = A.clone().detach().requires_grad_(True)
             
             result = scaled_dot_product_attention_backward(
-                q_clone, k_clone, v_clone, scaling, causal_mask, is_causal
+                q_clone, k_clone, v_clone, dt_clone, a_clone,
+                scaling, cache_position, keep_window_size, is_causal
             )
             if result[0] == "OOM":
                 results['sdpa_backward_status'] = 'OOM'
@@ -566,9 +695,12 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
                 q_clone = query_states.clone().detach().requires_grad_(True)
                 k_clone = key_states.clone().detach().requires_grad_(True)
                 v_clone = value_states.clone().detach().requires_grad_(True)
+                dt_clone = dt_proj.clone().detach().requires_grad_(True)
+                a_clone = A.clone().detach().requires_grad_(True)
                 
                 result = scaled_dot_product_attention_backward(
-                    q_clone, k_clone, v_clone, scaling, causal_mask, is_causal
+                    q_clone, k_clone, v_clone, dt_clone, a_clone,
+                    scaling, cache_position, keep_window_size, is_causal
                 )
                 
                 if result[0] == "OOM":
@@ -576,7 +708,18 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['sdpa_backward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['sdpa_backward_times'].append(elapsed_ms)  # ms
+                results['sdpa_backward_tflops'].append(
+                    compute_sdpa_backward_tflops(
+                        batch_size,
+                        num_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -630,7 +773,20 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['fdma_cuda_backward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['fdma_cuda_backward_times'].append(elapsed_ms)  # ms
+                results['fdma_cuda_backward_tflops'].append(
+                    compute_dmattn_backward_tflops(
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        keep_window_size,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -684,7 +840,20 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['fdma_triton_backward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['fdma_triton_backward_times'].append(elapsed_ms)  # ms
+                results['fdma_triton_backward_tflops'].append(
+                    compute_dmattn_backward_tflops(
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        keep_window_size,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -738,7 +907,20 @@ def benchmark_backward_attention_performance(config, test_type='all', num_runs=5
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['fdma_flex_backward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['fdma_flex_backward_times'].append(elapsed_ms)  # ms
+                results['fdma_flex_backward_tflops'].append(
+                    compute_dmattn_backward_tflops(
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        keep_window_size,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -819,55 +1001,203 @@ def run_backward_performance_benchmark(test_type='all', num_runs=3, warmup_runs=
     ]
     
     print(f"\n📊 Backward Pass Benchmark Results (averaged over {num_runs} runs):")
-    print(f"🔧 {'Configuration':<60} ⚡ {'SDPA-BWD':<12} 🚀 {'CUDA-BWD':<12} 🌟 {'Triton-BWD':<12} ✨ {'Flex-BWD':<15} 📈 {'Speedup':<15}")
-    print("🔄" + "-" * 160 + "🔄")
-    
+
+    table_rows = []
     all_results = []
-    
+
     for config in configs:
         try:
             results = benchmark_backward_attention_performance(config, test_type, num_runs, warmup_runs)
             all_results.append(results)
-            
-            # Format configuration string
+
             batch_size, num_heads, num_kv_heads, query_len, key_len, head_dim, keep_window_size, is_causal = config
-            config_str = f"B{batch_size} Hq{num_heads} Hkv{num_kv_heads} Q{query_len} K{key_len} D{head_dim} W{keep_window_size} {'C' if is_causal else 'N'}"
-            
-            # Calculate averages and format results
-            sdpa_avg = f"{sum(results['sdpa_backward_times'])/len(results['sdpa_backward_times']):.2f}ms" if results['sdpa_backward_times'] else results['sdpa_backward_status']
-            cuda_avg = f"{sum(results['fdma_cuda_backward_times'])/len(results['fdma_cuda_backward_times']):.2f}ms" if results['fdma_cuda_backward_times'] else results['fdma_cuda_backward_status']
-            triton_avg = f"{sum(results['fdma_triton_backward_times'])/len(results['fdma_triton_backward_times']):.2f}ms" if results['fdma_triton_backward_times'] else results['fdma_triton_backward_status']
-            flex_avg = f"{sum(results['fdma_flex_backward_times'])/len(results['fdma_flex_backward_times']):.2f}ms" if results['fdma_flex_backward_times'] else results['fdma_flex_backward_status']
+            config_label = (
+                f"B{batch_size} Hq{num_heads} Hkv{num_kv_heads} "
+                f"Q{query_len} K{key_len} D{head_dim} W{keep_window_size} "
+                f"{'C' if is_causal else 'N'}"
+            )
 
-            # Calculate speedup (SDPA vs others)
-            speedup_info = []
-            if results['sdpa_backward_times'] and results['fdma_cuda_backward_times']:
-                sdpa_time = sum(results['sdpa_backward_times'])/len(results['sdpa_backward_times'])
-                cuda_time = sum(results['fdma_cuda_backward_times'])/len(results['fdma_cuda_backward_times'])
-                speedup_info.append(f"CUDA: {sdpa_time/cuda_time:.1f}x")
-            
-            if results['sdpa_backward_times'] and results['fdma_triton_backward_times']:
-                sdpa_time = sum(results['sdpa_backward_times'])/len(results['sdpa_backward_times'])
-                triton_time = sum(results['fdma_triton_backward_times'])/len(results['fdma_triton_backward_times'])
-                speedup_info.append(f"Tri: {sdpa_time/triton_time:.1f}x")
+            implementations = {
+                'sdpa': (
+                    'sdpa_backward',
+                    results['sdpa_backward_status'],
+                    results['sdpa_backward_times'],
+                    results['sdpa_backward_tflops'],
+                ),
+                'cuda': (
+                    'fdma_cuda_backward',
+                    results['fdma_cuda_backward_status'],
+                    results['fdma_cuda_backward_times'],
+                    results['fdma_cuda_backward_tflops'],
+                ),
+                'triton': (
+                    'fdma_triton_backward',
+                    results['fdma_triton_backward_status'],
+                    results['fdma_triton_backward_times'],
+                    results['fdma_triton_backward_tflops'],
+                ),
+                'flex': (
+                    'fdma_flex_backward',
+                    results['fdma_flex_backward_status'],
+                    results['fdma_flex_backward_times'],
+                    results['fdma_flex_backward_tflops'],
+                ),
+            }
 
-            if results['sdpa_backward_times'] and results['fdma_flex_backward_times']:
-                sdpa_time = sum(results['sdpa_backward_times'])/len(results['sdpa_backward_times'])
-                flex_time = sum(results['fdma_flex_backward_times'])/len(results['fdma_flex_backward_times'])
-                speedup_info.append(f"Flex: {sdpa_time/flex_time:.1f}x")
-            
-            speedup_str = ", ".join(speedup_info) if speedup_info else "N/A"
-            
-            print(f"📊 {config_str:<60} ⚡ {sdpa_avg:<12} 🚀 {cuda_avg:<12} 🌟 {triton_avg:<12} ✨ {flex_avg:<15} 📈 {speedup_str:<15}")
-            
+            metrics = {}
+            time_avgs = {}
+
+            for impl_key, (_, status, times, tflops) in implementations.items():
+                metric = {
+                    "status": status,
+                    "avg_time": None,
+                    "avg_tflops": None,
+                    "display": status if status != 'success' else "N/A",
+                }
+
+                if status == 'success' and times:
+                    avg_time = sum(times) / len(times)
+                    avg_tflops = sum(tflops) / len(tflops) if tflops else 0.0
+                    metric["avg_time"] = avg_time
+                    metric["avg_tflops"] = avg_tflops
+                    metric["display"] = f"{avg_time:.2f} ms / {avg_tflops:.2f}"
+
+                metrics[impl_key] = metric
+                time_avgs[impl_key] = (
+                    metric["avg_time"] if metric["avg_time"] is not None else float('inf')
+                )
+
+            sdpa_avg = time_avgs.get('sdpa', float('inf'))
+
+            speedup_values = {}
+            for impl_key in ['cuda', 'triton', 'flex']:
+                impl_avg = time_avgs.get(impl_key, float('inf'))
+                if sdpa_avg != float('inf') and impl_avg != float('inf') and impl_avg > 0:
+                    speedup_values[impl_key] = sdpa_avg / impl_avg
+                else:
+                    speedup_values[impl_key] = None
+
+            best_impl = "N/A"
+            best_speedup_value = None
+            for impl_key, speedup_val in speedup_values.items():
+                if speedup_val is not None and (
+                    best_speedup_value is None or speedup_val > best_speedup_value
+                ):
+                    best_speedup_value = speedup_val
+                    best_impl = impl_key.upper()
+
+            if best_speedup_value is not None:
+                speedup_summary = f"{best_impl}:{best_speedup_value:.2f}x"
+            else:
+                speedup_summary = "N/A"
+
+            status_cells_display = []
+            status_cells_plain = []
+            for impl_key in ['sdpa', 'cuda', 'triton', 'flex']:
+                status = metrics[impl_key]['status']
+                if status == 'success':
+                    icon = "✅"
+                    color = "green"
+                elif status in {"OOM", "Not Available"}:
+                    icon = "❌"
+                    color = "red"
+                else:
+                    icon = "⚠️"
+                    color = "yellow"
+                status_cells_display.append(style_text(icon, color))
+                status_cells_plain.append(icon)
+
+            status_display = " ".join(status_cells_display)
+            status_plain = " ".join(status_cells_plain)
+
+            config_display = style_text(config_label, "magenta")
+
+            sdpa_plain = metrics['sdpa']['display']
+            cuda_plain = metrics['cuda']['display']
+            triton_plain = metrics['triton']['display']
+            flex_plain = metrics['flex']['display']
+
+            sdpa_display = format_metric_cell(
+                metrics['sdpa']['status'], sdpa_plain, success_color="blue"
+            )
+            cuda_display = format_metric_cell(
+                metrics['cuda']['status'], cuda_plain, success_color="green"
+            )
+            triton_display = format_metric_cell(
+                metrics['triton']['status'], triton_plain, success_color="magenta"
+            )
+            flex_display = format_metric_cell(
+                metrics['flex']['status'], flex_plain, success_color="cyan"
+            )
+
+            if speedup_summary != "N/A":
+                speedup_color_map = {'CUDA': 'green', 'TRITON': 'magenta', 'FLEX': 'cyan'}
+                speedup_display = style_text(
+                    speedup_summary, speedup_color_map.get(best_impl, 'blue'), bold=True
+                )
+            else:
+                speedup_display = style_text(speedup_summary, 'yellow')
+
+            table_rows.append([
+                (status_display, status_plain),
+                (config_display, config_label),
+                (sdpa_display, sdpa_plain),
+                (cuda_display, cuda_plain),
+                (triton_display, triton_plain),
+                (flex_display, flex_plain),
+                (speedup_display, speedup_summary),
+            ])
+
         except Exception as e:
             print(f"❌ Error in config {config}: {e}")
             continue
-    
-    print("🔄" + "-" * 160 + "🔄")
+
+    if table_rows:
+        header = [
+            "Status",
+            "Configuration",
+            "SDPA Backward (ms / TFLOPs)",
+            "CUDA Backward (ms / TFLOPs)",
+            "Triton Backward (ms / TFLOPs)",
+            "Flex Backward (ms / TFLOPs)",
+            "Speedup",
+        ]
+
+        num_cols = len(header)
+        all_plain_rows = [header] + [[cell[1] for cell in row] for row in table_rows]
+        col_widths = [
+            max(len(row[i]) for row in all_plain_rows)
+            for i in range(num_cols)
+        ]
+
+        header_cells = [
+            header[i].ljust(col_widths[i])
+            for i in range(num_cols)
+        ]
+        print("| " + " | ".join(header_cells) + " |")
+
+        separator_cells = ["-" * (width + 2) for width in col_widths]
+        print("|" + "|".join(separator_cells) + "|")
+
+        for row in table_rows:
+            padded_cells = []
+            for idx, (display, plain) in enumerate(row):
+                padding = col_widths[idx] - len(plain)
+                if padding < 0:
+                    padding = 0
+                padded_cells.append(display + " " * padding)
+            print("| " + " | ".join(padded_cells) + " |")
+    else:
+        print(style_text("No benchmark data available.", "yellow"))
     
     # Summary statistics
     implementation_speedups = {
+        'cuda': [],
+        'triton': [],
+        'flex': []
+    }
+    implementation_tflops = {
+        'sdpa': [],
         'cuda': [],
         'triton': [],
         'flex': []
@@ -888,19 +1218,76 @@ def run_backward_performance_benchmark(test_type='all', num_runs=3, warmup_runs=
             sdpa_time = sum(results['sdpa_backward_times'])/len(results['sdpa_backward_times'])
             flex_time = sum(results['fdma_flex_backward_times'])/len(results['fdma_flex_backward_times'])
             implementation_speedups['flex'].append(sdpa_time/flex_time)
+
+        if results['sdpa_backward_status'] == 'success' and results['sdpa_backward_tflops']:
+            implementation_tflops['sdpa'].append(
+                sum(results['sdpa_backward_tflops']) / len(results['sdpa_backward_tflops'])
+            )
+
+        if results['fdma_cuda_backward_status'] == 'success' and results['fdma_cuda_backward_tflops']:
+            implementation_tflops['cuda'].append(
+                sum(results['fdma_cuda_backward_tflops']) / len(results['fdma_cuda_backward_tflops'])
+            )
+
+        if results['fdma_triton_backward_status'] == 'success' and results['fdma_triton_backward_tflops']:
+            implementation_tflops['triton'].append(
+                sum(results['fdma_triton_backward_tflops']) / len(results['fdma_triton_backward_tflops'])
+            )
+
+        if results['fdma_flex_backward_status'] == 'success' and results['fdma_flex_backward_tflops']:
+            implementation_tflops['flex'].append(
+                sum(results['fdma_flex_backward_tflops']) / len(results['fdma_flex_backward_tflops'])
+            )
     
     print(f"\n🏆 Backward Pass Summary:")
-    
-    # Display statistics for each implementation
+
     for impl_key, speedups in implementation_speedups.items():
+        impl_name = impl_key.replace('_', '-').upper()
+        impl_label = style_text(impl_name, bold=True)
         if speedups:
-            impl_name = impl_key.upper()
             avg_speedup = sum(speedups) / len(speedups)
             max_speedup = max(speedups)
             min_speedup = min(speedups)
-            print(f"  🚀 {impl_name:7} speedup: avg={avg_speedup:.2f}x, max={max_speedup:.2f}x, min={min_speedup:.2f}x ({len(speedups)} configs)")
+
+            if avg_speedup > 2.0:
+                icon = "🔥"
+                color = "green"
+            elif avg_speedup > 1.5:
+                icon = "🚀"
+                color = "cyan"
+            elif avg_speedup > 1.0:
+                icon = "📈"
+                color = "orange"
+            else:
+                icon = "😐"
+                color = "yellow"
+
+            speedup_text = style_text(
+                f"Avg: {avg_speedup:.2f}x (Best: {max_speedup:.2f}x, Worst: {min_speedup:.2f}x)",
+                color,
+            )
+            print(f"  {icon} {impl_label} vs SDPA - {speedup_text}")
         else:
-            print(f"  ❌ {impl_key.upper():7} : No valid measurements")
+            message = style_text("No valid measurements", "red")
+            print(f"  ❌ {impl_label} vs SDPA - {message}")
+
+    print("\n📊 Average TFLOPs by implementation:")
+
+    for impl_key, values in implementation_tflops.items():
+        label = "SDPA" if impl_key == 'sdpa' else impl_key.upper()
+        label_text = style_text(label, bold=True)
+        if values:
+            avg_tflops = np.mean(values)
+            max_tflops = np.max(values)
+            min_tflops = np.min(values)
+            tflops_text = style_text(
+                f"Avg: {avg_tflops:.2f} TFLOPs (Best: {max_tflops:.2f}, Worst: {min_tflops:.2f})",
+                "blue",
+            )
+            print(f"  💡 {label_text} {tflops_text}")
+        else:
+            message = style_text("No TFLOPs measurements", "yellow")
+            print(f"  ⚠️ {label_text} {message}")
 
 
 def main():
