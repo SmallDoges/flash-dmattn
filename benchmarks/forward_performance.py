@@ -19,12 +19,25 @@ Benchmark includes:
 - Speedup comparisons across all implementations
 """
 
+import argparse
+import gc
+import os
+import sys
+import time
+from typing import Optional
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import argparse
-import time
-import gc
+
+try:
+    import colorama
+
+    colorama.just_fix_windows_console()
+except ImportError:  # pragma: no cover - optional dependency
+    colorama = None
+
+
 
 # Import the compiled CUDA extension
 try:
@@ -55,6 +68,60 @@ except ImportError as e:
     print("Please make sure the Flex Attention implementation is available.")
     # Don't exit here, just warn
     flex_dmattn_func = None
+
+
+ANSI_RESET = "\033[0m"
+ANSI_CODES = {
+    "green": "32",
+    "yellow": "33",
+    "red": "31",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+}
+
+
+def _supports_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    stream = getattr(sys, "stdout", None)
+    return bool(stream and stream.isatty())
+
+
+ENABLE_COLOR = _supports_color()
+
+
+def style_text(text: str, color: Optional[str] = None, bold: bool = False) -> str:
+    """Apply optional ANSI styling if the current environment supports color."""
+
+    if not ENABLE_COLOR or (color is None and not bold):
+        return text
+
+    codes = []
+    if bold:
+        codes.append("1")
+    if color and color in ANSI_CODES:
+        codes.append(ANSI_CODES[color])
+
+    if not codes:
+        return text
+
+    return f"\033[{';'.join(codes)}m{text}{ANSI_RESET}"
+
+
+def format_metric_cell(status: str, value: str, success_color: str = "cyan") -> str:
+    """Color-code metric cells based on status."""
+
+    if status == "success":
+        return style_text(value, success_color)
+
+    if status in {"OOM", "Not Available"}:
+        return style_text(value, "red")
+
+    if status in {"N/A"}:
+        return style_text(value, "yellow")
+
+    return style_text(value, "yellow")
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -452,6 +519,50 @@ def measure_memory_usage():
     return 0, 0
 
 
+def compute_sdpa_tflops(
+    batch_size: int,
+    num_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    elapsed_ms: float,
+) -> float:
+    """Estimate effective TFLOPs for the SDPA baseline given execution time.
+
+    Uses the conventional attention flop model consisting of two matrix
+    multiplications (QK^T and softmax-V application)."""
+
+    if elapsed_ms is None or elapsed_ms <= 0:
+        return 0.0
+
+    flop_count = 4 * batch_size * num_heads * query_len * key_len * head_dim
+    return flop_count / (elapsed_ms / 1000.0) / 1e12
+
+
+def compute_dmattn_tflops(
+    batch_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    query_len: int,
+    key_len: int,
+    head_dim: int,
+    keep_window_size: int,
+    elapsed_ms: float,
+) -> float:
+    """Estimate effective TFLOPs for dynamic mask attention kernels.
+
+    Calculates compute density using the configured keep window as the
+    effective key length processed per query."""
+
+    if elapsed_ms is None or elapsed_ms <= 0:
+        return 0.0
+
+    effective_keys = min(key_len, keep_window_size)
+    # Dynamic mask kernels ultimately operate over repeated heads after GQA expansion.
+    flop_count = 4 * batch_size * num_heads * query_len * effective_keys * head_dim
+    return flop_count / (elapsed_ms / 1000.0) / 1e12
+
+
 def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_runs=2):
     """
     Benchmark attention performance for a given configuration.
@@ -503,9 +614,13 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
     results = {
         'config': config,
         'sdpa_forward_times': [],
+        'sdpa_forward_tflops': [],
         'fdma_cuda_forward_times': [],
+        'fdma_cuda_forward_tflops': [],
         'fdma_triton_forward_times': [],
+        'fdma_triton_forward_tflops': [],
         'fdma_flex_forward_times': [],
+        'fdma_flex_forward_tflops': [],
         'sdpa_forward_memory': 0,
         'fdma_cuda_forward_memory': 0,
         'fdma_triton_forward_memory': 0,
@@ -554,7 +669,18 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['sdpa_forward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['sdpa_forward_times'].append(elapsed_ms)  # ms
+                results['sdpa_forward_tflops'].append(
+                    compute_sdpa_tflops(
+                        batch_size,
+                        num_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -596,7 +722,20 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['fdma_cuda_forward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['fdma_cuda_forward_times'].append(elapsed_ms)  # ms
+                results['fdma_cuda_forward_tflops'].append(
+                    compute_dmattn_tflops(
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        keep_window_size,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -638,7 +777,20 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['fdma_triton_forward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['fdma_triton_forward_times'].append(elapsed_ms)  # ms
+                results['fdma_triton_forward_tflops'].append(
+                    compute_dmattn_tflops(
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        keep_window_size,
+                        elapsed_ms,
+                    )
+                )
             
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -680,7 +832,20 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
                     break
                 
                 # Use the timing from the function instead of measuring here
-                results['fdma_flex_forward_times'].append(result[1])  # ms
+                elapsed_ms = result[1]
+                results['fdma_flex_forward_times'].append(elapsed_ms)  # ms
+                results['fdma_flex_forward_tflops'].append(
+                    compute_dmattn_tflops(
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        query_len,
+                        key_len,
+                        head_dim,
+                        keep_window_size,
+                        elapsed_ms,
+                    )
+                )
 
             # Measure memory after
             mem_after = measure_memory_usage()
@@ -721,69 +886,67 @@ def run_performance_benchmark(test_type='all', num_runs=3, warmup_runs=2):
     # Test configurations: (batch_size, num_heads, num_kv_heads, query_len, key_len, head_dim, keep_window_size, is_causal)
     configs = [
         # Vary sequence length
-        (1, 2, 1, 256, 256, 128, 1024, True),
-        (1, 2, 1, 512, 512, 128, 1024, True),
-        (1, 2, 1, 1024, 1024, 128, 1024, True),
-        (1, 2, 1, 2048, 2048, 128, 1024, True),
-        (1, 2, 1, 4096, 4096, 128, 1024, True),
-        (1, 2, 1, 8192, 8192, 128, 1024, True),
-        (1, 2, 1, 16384, 16384, 128, 1024, True),
-        (1, 2, 1, 32768, 32768, 128, 1024, True),
+        (1, 2, 1, 256, 256, 64, 1024, True),
+        (1, 2, 1, 512, 512, 64, 1024, True),
+        (1, 2, 1, 1024, 1024, 64, 1024, True),
+        (1, 2, 1, 2048, 2048, 64, 1024, True),
+        (1, 2, 1, 4096, 4096, 64, 1024, True),
+        (1, 2, 1, 8192, 8192, 64, 1024, True),
+        (1, 2, 1, 16384, 16384, 64, 1024, True),
+        (1, 2, 1, 32768, 32768, 64, 1024, True),
 
         # Inference
-        (1, 2, 1, 1, 256, 128, 1024, True),
-        (1, 2, 1, 1, 512, 128, 1024, True),
-        (1, 2, 1, 1, 1024, 128, 1024, True),
-        (1, 2, 1, 1, 2048, 128, 1024, True),
-        (1, 2, 1, 1, 4096, 128, 1024, True),
-        (1, 2, 1, 1, 8192, 128, 1024, True),
-        (1, 2, 1, 1, 16384, 128, 1024, True),
-        (1, 2, 1, 1, 32768, 128, 1024, True),
-        (1, 2, 1, 1, 65536, 128, 1024, True),
-        (1, 2, 1, 1, 131072, 128, 1024, True),
-        (1, 2, 1, 1, 262144, 128, 1024, True),
-        (1, 2, 1, 1, 524288, 128, 1024, True),
+        (1, 2, 1, 1, 256, 64, 1024, True),
+        (1, 2, 1, 1, 512, 64, 1024, True),
+        (1, 2, 1, 1, 1024, 64, 1024, True),
+        (1, 2, 1, 1, 2048, 64, 1024, True),
+        (1, 2, 1, 1, 4096, 64, 1024, True),
+        (1, 2, 1, 1, 8192, 64, 1024, True),
+        (1, 2, 1, 1, 16384, 64, 1024, True),
+        (1, 2, 1, 1, 32768, 64, 1024, True),
+        (1, 2, 1, 1, 65536, 64, 1024, True),
+        (1, 2, 1, 1, 131072, 64, 1024, True),
+        (1, 2, 1, 1, 262144, 64, 1024, True),
+        (1, 2, 1, 1, 524288, 64, 1024, True),
         
         # Vary batch size
-        (1, 2, 1, 4096, 4096, 32, 1024, True),
-        (2, 2, 1, 4096, 4096, 32, 1024, True),
-        (4, 2, 1, 4096, 4096, 32, 1024, True),
-        (8, 2, 1, 4096, 4096, 32, 1024, True),
+        (1, 2, 1, 4096, 4096, 64, 1024, True),
+        (2, 2, 1, 4096, 4096, 64, 1024, True),
+        (4, 2, 1, 4096, 4096, 64, 1024, True),
+        (8, 2, 1, 4096, 4096, 64, 1024, True),
         
         # Vary head count
-        (1, 1, 1, 4096, 4096, 32, 1024, True),
-        (1, 2, 1, 4096, 4096, 32, 1024, True),
-        (1, 4, 1, 4096, 4096, 32, 1024, True),
-        (1, 8, 2, 4096, 4096, 32, 1024, True),
-        
-        # Vary head dimension
-        (1, 2, 1, 4096, 4096, 32, 1024, True),
+        (1, 1, 1, 4096, 4096, 64, 1024, True),
         (1, 2, 1, 4096, 4096, 64, 1024, True),
-        (1, 2, 1, 4096, 4096, 96, 1024, True),
-        (1, 2, 1, 4096, 4096, 128, 1024, True),
-        (1, 2, 1, 4096, 4096, 192, 1024, True),
-        (1, 2, 1, 4096, 4096, 256, 1024, True),
+        (1, 4, 1, 4096, 4096, 64, 1024, True),
+        (1, 8, 2, 4096, 4096, 64, 1024, True),
+        
+        # # Vary head dimension
+        # (1, 2, 1, 4096, 4096, 32, 1024, True),
+        # (1, 2, 1, 4096, 4096, 64, 1024, True),
+        # (1, 2, 1, 4096, 4096, 96, 1024, True),
+        # (1, 2, 1, 4096, 4096, 128, 1024, True),
+        # (1, 2, 1, 4096, 4096, 192, 1024, True),
+        # (1, 2, 1, 4096, 4096, 256, 1024, True),
         
         # Vary keep_window_size
-        (1, 2, 1, 32768, 32768, 128, 32, True),
-        (1, 2, 1, 32768, 32768, 128, 64, True),
-        (1, 2, 1, 32768, 32768, 128, 128, True),
-        (1, 2, 1, 32768, 32768, 128, 256, True),
-        (1, 2, 1, 32768, 32768, 128, 512, True),
-        (1, 2, 1, 32768, 32768, 128, 1024, True),
-        (1, 2, 1, 32768, 32768, 128, 2048, True),
-        (1, 2, 1, 32768, 32768, 128, 4096, True),
-        (1, 2, 1, 32768, 32768, 128, 8192, True),
-        (1, 2, 1, 32768, 32768, 128, 16384, True),
-        (1, 2, 1, 32768, 32768, 128, 32768, True),
+        (1, 2, 1, 32768, 32768, 64, 32, True),
+        (1, 2, 1, 32768, 32768, 64, 64, True),
+        (1, 2, 1, 32768, 32768, 64, 128, True),
+        (1, 2, 1, 32768, 32768, 64, 256, True),
+        (1, 2, 1, 32768, 32768, 64, 512, True),
+        (1, 2, 1, 32768, 32768, 64, 1024, True),
+        (1, 2, 1, 32768, 32768, 64, 2048, True),
+        (1, 2, 1, 32768, 32768, 64, 4096, True),
+        (1, 2, 1, 32768, 32768, 64, 8192, True),
+        (1, 2, 1, 32768, 32768, 64, 16384, True),
+        (1, 2, 1, 32768, 32768, 64, 32768, True),
     ]
     
     print(f"\n📊 Benchmark Results (averaged over {num_runs} runs):")
-    print(f"🔧 {'Configuration':<60} ⚡ {'SDPA':<10} 🚀 {'CUDA':<10} 🌟 {'Triton':<10} 🌟 {'Flex':<15} 📈 {'Speedup':<15}")
-    print("🔄" + "-" * 150 + "🔄")
-    
+    table_rows = []
     all_results = []
-    
+
     for config in configs:
         batch_size, num_heads, num_kv_heads, query_len, key_len, head_dim, keep_window_size, is_causal = config
         
@@ -792,124 +955,278 @@ def run_performance_benchmark(test_type='all', num_runs=3, warmup_runs=2):
         
         # Calculate averages for all implementations
         implementations = {
-            'sdpa': ('sdpa_forward', results['sdpa_forward_status'], results['sdpa_forward_times']),
-            'cuda': ('fdma_cuda_forward', results['fdma_cuda_forward_status'], results['fdma_cuda_forward_times']),
-            'triton': ('fdma_triton_forward', results['fdma_triton_forward_status'], results['fdma_triton_forward_times']),
-            'flex': ('fdma_flex_forward', results['fdma_flex_forward_status'], results['fdma_flex_forward_times'])
+            'sdpa': (
+                'sdpa_forward',
+                results['sdpa_forward_status'],
+                results['sdpa_forward_times'],
+                results['sdpa_forward_tflops'],
+            ),
+            'cuda': (
+                'fdma_cuda_forward',
+                results['fdma_cuda_forward_status'],
+                results['fdma_cuda_forward_times'],
+                results['fdma_cuda_forward_tflops'],
+            ),
+            'triton': (
+                'fdma_triton_forward',
+                results['fdma_triton_forward_status'],
+                results['fdma_triton_forward_times'],
+                results['fdma_triton_forward_tflops'],
+            ),
+            'flex': (
+                'fdma_flex_forward',
+                results['fdma_flex_forward_status'],
+                results['fdma_flex_forward_times'],
+                results['fdma_flex_forward_tflops'],
+            ),
         }
         
-        # Calculate time strings and averages
-        time_strs = {}
+        metrics = {}
         time_avgs = {}
-        
-        for impl_key, (_, status, times) in implementations.items():
+
+        for impl_key, (_, status, times, tflops) in implementations.items():
+            metric = {
+                "status": status,
+                "avg_time": None,
+                "avg_tflops": None,
+                "display": status if status != 'success' else "N/A",
+            }
+
             if status == 'success' and times:
                 avg_time = sum(times) / len(times)
-                time_strs[impl_key] = f"{avg_time:.2f}"
-                time_avgs[impl_key] = avg_time
-            else:
-                time_strs[impl_key] = status[:8]  # Truncate status for display
-                time_avgs[impl_key] = float('inf')
-        
-        # Calculate speedups
-        speedup_strs = {}
+                avg_tflops = sum(tflops) / len(tflops) if tflops else 0.0
+                metric["avg_time"] = avg_time
+                metric["avg_tflops"] = avg_tflops
+                metric["display"] = f"{avg_time:.2f} ms / {avg_tflops:.2f}"
+
+            metrics[impl_key] = metric
+            time_avgs[impl_key] = (
+                metric["avg_time"] if metric["avg_time"] is not None else float('inf')
+            )
+
         flash_avg = time_avgs.get('sdpa', float('inf'))
-        
+
+        speedup_values = {}
         for impl_key in ['cuda', 'triton', 'flex']:
             impl_avg = time_avgs.get(impl_key, float('inf'))
             if flash_avg != float('inf') and impl_avg != float('inf') and impl_avg > 0:
-                speedup = flash_avg / impl_avg
-                speedup_strs[impl_key] = f"{speedup:.2f}x"
+                speedup_values[impl_key] = flash_avg / impl_avg
             else:
-                speedup_strs[impl_key] = "N/A"
-        
-        # Format output with shorter config string
-        config_short = f" B{batch_size} Hq{num_heads} Hkv{num_kv_heads} Q{query_len} K{key_len} D{head_dim} W{keep_window_size} "
-        if not is_causal:
-            config_short += "N"
-        else:
-            config_short += "C"
-        
-        # Add status icons
-        icons = ""
-        for impl_key, (_, status, _) in implementations.items():
-            if status == 'success':
-                icons += " ✅ "
-            elif status in ['OOM', 'Not Available']:
-                icons += " ❌ "
-            else:
-                icons += " ⚠️ "
-        
-        # Create speedup summary (best performing implementation)
-        best_speedup = "N/A"
+                speedup_values[impl_key] = None
+
         best_impl = "N/A"
-        for impl_key, speedup_str in speedup_strs.items():
-            if speedup_str != "N/A":
-                try:
-                    speedup_val = float(speedup_str.replace('x', ''))
-                    if best_speedup == "N/A" or speedup_val > float(best_speedup.replace('x', '')):
-                        best_speedup = speedup_str
-                        best_impl = impl_key.upper()
-                except:
-                    continue
-        
-        speedup_summary = f"{best_impl}:{best_speedup}" if best_speedup != "N/A" else "N/A"
-        
-        print(f"{icons} {config_short:<48} {time_strs['sdpa']:<12} {time_strs['cuda']:<12} {time_strs['triton']:<12} {time_strs['flex']:<18} {speedup_summary:<15}")
-    
-    print("🔄" + "-" * 150 + "🔄")
-    
+        best_speedup_value = None
+        for impl_key, speedup_val in speedup_values.items():
+            if speedup_val is not None and (
+                best_speedup_value is None or speedup_val > best_speedup_value
+            ):
+                best_speedup_value = speedup_val
+                best_impl = impl_key.upper()
+
+        if best_speedup_value is not None:
+            speedup_summary = f"{best_impl}:{best_speedup_value:.2f}x"
+        else:
+            speedup_summary = "N/A"
+
+        config_label = (
+            f"B{batch_size} Hq{num_heads} Hkv{num_kv_heads} "
+            f"Q{query_len} K{key_len} D{head_dim} W{keep_window_size} "
+            f"{'C' if is_causal else 'N'}"
+        )
+
+        status_cells_display = []
+        status_cells_plain = []
+        for impl_key in ['sdpa', 'cuda', 'triton', 'flex']:
+            status = metrics[impl_key]['status']
+            if status == 'success':
+                icon = "✅"
+                color = "green"
+            elif status in {"OOM", "Not Available"}:
+                icon = "❌"
+                color = "red"
+            else:
+                icon = "⚠️"
+                color = "yellow"
+            status_cells_display.append(style_text(icon, color))
+            status_cells_plain.append(icon)
+        status_display = " ".join(status_cells_display) + " "
+        status_plain = " ".join(status_cells_plain) + " "
+
+        config_display = style_text(config_label, "magenta")
+        config_plain = config_label
+
+        sdpa_plain = metrics['sdpa']['display']
+        cuda_plain = metrics['cuda']['display']
+        triton_plain = metrics['triton']['display']
+        flex_plain = metrics['flex']['display']
+
+        sdpa_display = format_metric_cell(
+            metrics['sdpa']['status'], sdpa_plain, success_color="blue"
+        )
+        cuda_display = format_metric_cell(
+            metrics['cuda']['status'], cuda_plain, success_color="green"
+        )
+        triton_display = format_metric_cell(
+            metrics['triton']['status'], triton_plain, success_color="magenta"
+        )
+        flex_display = format_metric_cell(
+            metrics['flex']['status'], flex_plain, success_color="cyan"
+        )
+
+        if speedup_summary != "N/A":
+            speedup_color_map = {'CUDA': 'green', 'TRITON': 'magenta', 'FLEX': 'cyan'}
+            speedup_display = style_text(speedup_summary, speedup_color_map.get(best_impl, 'blue'), bold=True)
+        else:
+            speedup_display = style_text(speedup_summary, 'yellow')
+        speedup_plain = speedup_summary
+
+        table_rows.append([
+            (status_display, status_plain),
+            (config_display, config_plain),
+            (sdpa_display, sdpa_plain),
+            (cuda_display, cuda_plain),
+            (triton_display, triton_plain),
+            (flex_display, flex_plain),
+            (speedup_display, speedup_plain),
+        ])
+
+    if table_rows:
+        header = [
+            "Status",
+            "Configuration",
+            "SDPA (ms / TFLOPs)",
+            "CUDA (ms / TFLOPs)",
+            "Triton (ms / TFLOPs)",
+            "Flex (ms / TFLOPs)",
+            "Speedup",
+        ]
+
+        num_cols = len(header)
+        all_plain_rows = [header] + [[cell[1] for cell in row] for row in table_rows]
+        col_widths = [
+            max(len(row[i]) for row in all_plain_rows)
+            for i in range(num_cols)
+        ]
+
+        header_cells = [
+            header[i].ljust(col_widths[i])
+            for i in range(num_cols)
+        ]
+        print("| " + " | ".join(header_cells) + " |")
+
+        separator_cells = ["-" * (width + 2) for width in col_widths]
+        print("|" + "|".join(separator_cells) + "|")
+
+        for row in table_rows:
+            padded_cells = []
+            for idx, (display, plain) in enumerate(row):
+                padding = col_widths[idx] - len(plain)
+                if padding < 0:
+                    padding = 0
+                padded_cells.append(display + " " * padding)
+            print("| " + " | ".join(padded_cells) + " |")
+
     # Summary statistics
     implementation_speedups = {
         'cuda': [],
         'triton': [],
         'flex': []
     }
-    
+    implementation_tflops = {
+        'sdpa': [],
+        'cuda': [],
+        'triton': [],
+        'flex': []
+    }
+
     for results in all_results:
-        if results['sdpa_forward_status'] == 'success' and results['sdpa_forward_times']:
-            flash_avg = sum(results['sdpa_forward_times']) / len(results['sdpa_forward_times'])
+        if results['sdpa_forward_status'] != 'success' or not results['sdpa_forward_times']:
+            continue
 
-            # Calculate speedups for each implementation
-            for impl_key in implementation_speedups.keys():
-                # Map implementation keys to actual result keys
-                if impl_key == 'cuda':
-                    status_key = 'fdma_cuda_forward_status'
-                    times_key = 'fdma_cuda_forward_times'
-                else:
-                    status_key = f'fdma_{impl_key}_forward_status'
-                    times_key = f'fdma_{impl_key}_forward_times'
+        flash_avg = sum(results['sdpa_forward_times']) / len(results['sdpa_forward_times'])
+        if results['sdpa_forward_tflops']:
+            implementation_tflops['sdpa'].append(
+                sum(results['sdpa_forward_tflops']) / len(results['sdpa_forward_tflops'])
+            )
 
-                if (status_key in results and results[status_key] == 'success' and 
-                    times_key in results and results[times_key]):
-                    
-                    impl_avg = sum(results[times_key]) / len(results[times_key])
-                    if impl_avg > 0:
-                        implementation_speedups[impl_key].append(flash_avg / impl_avg)
-    
+        for impl_key in implementation_speedups.keys():
+            if impl_key == 'cuda':
+                status_key = 'fdma_cuda_forward_status'
+                times_key = 'fdma_cuda_forward_times'
+                tflops_key = 'fdma_cuda_forward_tflops'
+            else:
+                status_key = f'fdma_{impl_key}_forward_status'
+                times_key = f'fdma_{impl_key}_forward_times'
+                tflops_key = f'fdma_{impl_key}_forward_tflops'
+
+            if (
+                status_key in results
+                and results[status_key] == 'success'
+                and times_key in results
+                and results[times_key]
+            ):
+                impl_avg = sum(results[times_key]) / len(results[times_key])
+                if impl_avg > 0:
+                    implementation_speedups[impl_key].append(flash_avg / impl_avg)
+
+            if (
+                status_key in results
+                and results[status_key] == 'success'
+                and tflops_key in results
+                and results[tflops_key]
+            ):
+                implementation_tflops[impl_key].append(
+                    sum(results[tflops_key]) / len(results[tflops_key])
+                )
+
     print(f"\n🏆 Summary:")
-    
-    # Display statistics for each implementation
+
     for impl_key, speedups in implementation_speedups.items():
+        impl_name = impl_key.replace('_', '-').upper()
+        impl_label = style_text(impl_name, bold=True)
         if speedups:
             avg_speedup = np.mean(speedups)
             max_speedup = np.max(speedups)
             min_speedup = np.min(speedups)
-            
-            # Choose appropriate icon based on performance
+
             if avg_speedup > 2.0:
                 icon = "🔥"
+                color = "green"
             elif avg_speedup > 1.5:
                 icon = "🚀"
+                color = "cyan"
             elif avg_speedup > 1.0:
                 icon = "📈"
+                color = "orange"
             else:
                 icon = "😐"
-            
-            impl_name = impl_key.replace('_', '-').upper()
-            print(f"  {icon} {impl_name:10} vs SDPA - Avg: {avg_speedup:.2f}x (Best: {max_speedup:.2f}x, Worst: {min_speedup:.2f}x)")
+                color = "yellow"
+
+            speedup_text = style_text(
+                f"Avg: {avg_speedup:.2f}x (Best: {max_speedup:.2f}x, Worst: {min_speedup:.2f}x)",
+                color,
+            )
+            print(f"  {icon} {impl_label} vs SDPA - {speedup_text}")
         else:
-            print(f"  ❌ {impl_key.replace('_', '-').upper():10} vs SDPA - No successful runs")
+            message = style_text("No successful runs", "red")
+            print(f"  ❌ {impl_label} vs SDPA - {message}")
+
+    print("\n📊 Average TFLOPs by implementation:")
+    for impl_key, values in implementation_tflops.items():
+        label = "SDPA" if impl_key == 'sdpa' else impl_key.upper()
+        label_text = style_text(label, bold=True)
+        if values:
+            avg_tflops = np.mean(values)
+            max_tflops = np.max(values)
+            min_tflops = np.min(values)
+            tflops_text = style_text(
+                f"Avg: {avg_tflops:.2f} TFLOPs (Best: {max_tflops:.2f}, Worst: {min_tflops:.2f})",
+                "blue",
+            )
+            print(f"  💡 {label_text} {tflops_text}")
+        else:
+            message = style_text("No TFLOPs measurements", "yellow")
+            print(f"  ⚠️ {label_text} {message}")
 
 
 def main():
