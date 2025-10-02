@@ -1212,6 +1212,7 @@ def run_performance_benchmark(test_type='all', num_runs=3, warmup_runs=2):
             print(f"  ❌ {impl_label} vs SDPA - {message}")
 
     print("\n📊 Average TFLOPs by implementation:")
+
     for impl_key, values in implementation_tflops.items():
         label = "SDPA" if impl_key == 'sdpa' else impl_key.upper()
         label_text = style_text(label, bold=True)
