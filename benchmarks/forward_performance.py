@@ -216,8 +216,11 @@ def scaled_dot_product_attention_cuda(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
+    dt_proj: torch.Tensor,
+    A: torch.Tensor,
     scaling: float,
-    causal_mask: torch.Tensor,
+    cache_position: torch.Tensor,
+    keep_window_size=2048,
     is_causal=True,
 ):
     """
@@ -234,25 +237,36 @@ def scaled_dot_product_attention_cuda(
     Returns:
         attn_outputs or "OOM" if out of memory
     """
-    _, _, query_len, _ = query_states.shape
-    _, _, key_len, _ = key_states.shape
-    if query_len > 32768 and key_len > 32768:
-        return "OOM"
+    _, num_heads, query_len, _ = query_states.shape
+    _, num_kv_heads, key_len, _ = key_states.shape
+    num_queries_per_kv = num_heads // num_kv_heads
+
+    # Calculate zoh_states
+    zoh_states = calculate_zoh_states(value_states, dt_proj, A)
+
+    # Use prepare_dynamic_mask to get the processed attention mask
+    attn_bias, attn_mask = prepare_dynamic_mask(
+        query_states,
+        zoh_states,
+        keep_window_size,
+        cache_position if is_causal else None
+    )   # [batch_size, num_kv_heads, query_len, key_len]
 
     query_states = query_states.contiguous()
     key_states = key_states.contiguous()
     value_states = value_states.contiguous()
+    attn_bias = repeat_kv(attn_bias, num_queries_per_kv).contiguous()
 
     try:
         # Only measure the core attention computation
         torch.cuda.synchronize()
         start_time = time.time()
 
-        attn_outputs = torch.nn.functional.scaled_dot_product_attention(
+        attn_outputs = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attn_mask=causal_mask,
+            attn_mask=attn_bias,
             scale=scaling,
             # is_causal=is_causal if query_len == key_len else False,
             enable_gqa=True
@@ -646,7 +660,8 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
         for _ in range(warmup_runs):
             result = scaled_dot_product_attention_cuda(
                 query_states, key_states, value_states,
-                scaling, causal_mask, is_causal
+                dt_proj, A, scaling, cache_position,
+                keep_window_size, is_causal
             )
             if result[0] == "OOM":
                 results['sdpa_forward_status'] = 'OOM'
@@ -661,7 +676,8 @@ def benchmark_attention_performance(config, test_type='all', num_runs=5, warmup_
             for _ in range(num_runs):
                 result = scaled_dot_product_attention_cuda(
                     query_states, key_states, value_states,
-                    scaling, causal_mask, is_causal
+                    dt_proj, A, scaling, cache_position,
+                    keep_window_size, is_causal
                 )
                 
                 if result[0] == "OOM":
@@ -921,13 +937,13 @@ def run_performance_benchmark(test_type='all', num_runs=3, warmup_runs=2):
         (1, 4, 1, 4096, 4096, 64, 1024, True),
         (1, 8, 2, 4096, 4096, 64, 1024, True),
         
-        # # Vary head dimension
-        # (1, 2, 1, 4096, 4096, 32, 1024, True),
-        # (1, 2, 1, 4096, 4096, 64, 1024, True),
-        # (1, 2, 1, 4096, 4096, 96, 1024, True),
-        # (1, 2, 1, 4096, 4096, 128, 1024, True),
-        # (1, 2, 1, 4096, 4096, 192, 1024, True),
-        # (1, 2, 1, 4096, 4096, 256, 1024, True),
+        # Vary head dimension
+        (1, 2, 1, 4096, 4096, 32, 1024, True),
+        (1, 2, 1, 4096, 4096, 64, 1024, True),
+        (1, 2, 1, 4096, 4096, 96, 1024, True),
+        (1, 2, 1, 4096, 4096, 128, 1024, True),
+        (1, 2, 1, 4096, 4096, 192, 1024, True),
+        (1, 2, 1, 4096, 4096, 256, 1024, True),
         
         # Vary keep_window_size
         (1, 2, 1, 32768, 32768, 64, 32, True),
