@@ -36,17 +36,29 @@ struct BlockInfo {
     }
 
     template <typename index_t>
-    __forceinline__ __device__ index_t mask_offset(const index_t batch_stride, const index_t row_stride, const int bidb) const {
-        index_t offset = sum_s_q == -1 ? bidb * batch_stride : uint32_t(sum_s_q) * row_stride;
-        sum_s_k == -1 ? offset += leftpad_k : offset += uint32_t(sum_s_k + leftpad_k);
-        return offset;
+    __forceinline__ __device__ index_t mask_offset(const index_t batch_stride, const index_t row_stride, const int bidb, const bool is_k_based = false) const {
+        if (is_k_based) {
+            // For total_k-based layouts, only use k offset (broadcast across query positions)
+            return sum_s_k == -1 ? bidb * batch_stride + leftpad_k : uint32_t(sum_s_k + leftpad_k);
+        } else {
+            // For total_q-based layouts, use both q and k offsets
+            index_t offset = sum_s_q == -1 ? bidb * batch_stride : uint32_t(sum_s_q) * row_stride;
+            sum_s_k == -1 ? offset += leftpad_k : offset += uint32_t(sum_s_k + leftpad_k);
+            return offset;
+        }
     }
 
     template <typename index_t>
-    __forceinline__ __device__ index_t bias_offset(const index_t batch_stride, const index_t row_stride, const int bidb) const {
-        index_t offset = sum_s_q == -1 ? bidb * batch_stride : uint32_t(sum_s_q) * row_stride;
-        sum_s_k == -1 ? offset += leftpad_k : offset += uint32_t(sum_s_k + leftpad_k);
-        return offset;
+    __forceinline__ __device__ index_t bias_offset(const index_t batch_stride, const index_t row_stride, const int bidb, const bool is_k_based = false) const {
+        if (is_k_based) {
+            // For total_k-based layouts, only use k offset (broadcast across query positions)
+            return sum_s_k == -1 ? bidb * batch_stride + leftpad_k : uint32_t(sum_s_k + leftpad_k);
+        } else {
+            // For total_q-based layouts, use both q and k offsets
+            index_t offset = sum_s_q == -1 ? bidb * batch_stride : uint32_t(sum_s_q) * row_stride;
+            sum_s_k == -1 ? offset += leftpad_k : offset += uint32_t(sum_s_k + leftpad_k);
+            return offset;
+        }
     }
 
     const int sum_s_q;
