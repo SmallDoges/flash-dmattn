@@ -19,6 +19,7 @@ Flash-DMA is a high-performance attention implementation that integrates Flash A
 
 ### 🎯 Core Kernel Advantages
 - **Mask & Bias Support**: Native support for `(batch_size, {1|num_kv_heads|num_heads}, {0|query_len}, key_len)` shaped attention mask and attention bias tensors
+- **Broadcastable Key-based Layouts** 🆕: Variable-length batch inference now supports efficient `(total_k, num_heads_variant)` mask/bias tensors that broadcast across query positions, eliminating redundant materialization for autoregressive decoding
 - **Intelligent Computation Skipping**: Block-level automatic skipping mechanism based on masks, completely bypassing computation and memory access for zero-mask blocks
 - **Complete Gradient Support**: Built-in full gradient computation path for attention bias, supporting end-to-end training
 
@@ -254,6 +255,7 @@ Flash-DMA integrates the efficient memory access patterns of Flash Attention wit
 
 - **[API Reference](docs/api_reference.md)** - Complete function documentation and usage examples
 - **[Integration Guide](docs/integration.md)** - Detailed technical documentation of the Flash Attention integration
+- **[Variable Length Broadcastable Mask/Bias](docs/varlen_broadcastable_mask.md)** 🆕 - Guide to using key-based broadcastable masks and bias for efficient batch inference
 
 
 ## Building from Source
