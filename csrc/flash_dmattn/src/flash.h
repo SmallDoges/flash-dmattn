@@ -56,6 +56,7 @@ struct Mask_params {
     int h_h_mask_ratio; // precompute h / h_mask
 
     bool has_mask;
+    bool mask_layout_is_k_based;  // If true, mask is shaped (total_k, num_heads_variant) for broadcasting
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -73,6 +74,7 @@ struct Bias_params {
     int h_h_bias_ratio; // precompute h / h_bias
 
     bool has_bias;
+    bool bias_layout_is_k_based;  // If true, bias is shaped (total_k, num_heads_variant) for broadcasting
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

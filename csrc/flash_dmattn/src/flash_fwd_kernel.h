@@ -170,9 +170,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         make_coord(_, 0)
     );  // (kBlockN, kHeadDim, nblocksN)
     Tensor mMask = make_tensor(
-        make_gmem_ptr(reinterpret_cast<ElementMask*>(params.mask_ptr) + binfo.mask_offset(params.mask_batch_stride, params.mask_row_stride, bidb)),
-        make_shape(params.h_mask, binfo.actual_seqlen_q, binfo.actual_seqlen_k),
-        make_stride(params.mask_head_stride, params.mask_row_stride, _1{})
+        make_gmem_ptr(reinterpret_cast<ElementMask*>(params.mask_ptr) + binfo.mask_offset(params.mask_batch_stride, params.mask_row_stride, bidb, params.mask_layout_is_k_based)),
+        params.mask_layout_is_k_based 
+            ? make_shape(params.h_mask, _1{}, binfo.actual_seqlen_k)  // (h, 1, k) for k-based layout
+            : make_shape(params.h_mask, binfo.actual_seqlen_q, binfo.actual_seqlen_k),  // (h, q, k) for q-based layout
+        params.mask_layout_is_k_based
+            ? make_stride(params.mask_head_stride, _0{}, _1{})  // Broadcast across q dimension
+            : make_stride(params.mask_head_stride, params.mask_row_stride, _1{})
     );
     Tensor gMask = local_tile(
         mMask(bidh / params.h_h_mask_ratio, _, _),
@@ -180,9 +184,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         make_coord(m_block, _)
     );  // (kBlockM, kBlockN, nblocksN)
     Tensor mBias = make_tensor(
-        make_gmem_ptr(reinterpret_cast<Element*>(params.bias_ptr) + binfo.bias_offset(params.bias_batch_stride, params.bias_row_stride, bidb)),
-        make_shape(params.h_bias, binfo.actual_seqlen_q, binfo.actual_seqlen_k),
-        make_stride(params.bias_head_stride, params.bias_row_stride, _1{})
+        make_gmem_ptr(reinterpret_cast<Element*>(params.bias_ptr) + binfo.bias_offset(params.bias_batch_stride, params.bias_row_stride, bidb, params.bias_layout_is_k_based)),
+        params.bias_layout_is_k_based 
+            ? make_shape(params.h_bias, _1{}, binfo.actual_seqlen_k)  // (h, 1, k) for k-based layout
+            : make_shape(params.h_bias, binfo.actual_seqlen_q, binfo.actual_seqlen_k),  // (h, q, k) for q-based layout
+        params.bias_layout_is_k_based
+            ? make_stride(params.bias_head_stride, _0{}, _1{})  // Broadcast across q dimension
+            : make_stride(params.bias_head_stride, params.bias_row_stride, _1{})
     );
     Tensor gBias = local_tile(
         mBias(bidh / params.h_h_bias_ratio, _, _),
@@ -928,15 +936,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
         : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
     const index_t col_offset_mask = (block_table == nullptr)
-        ? binfo.mask_offset(params.mask_batch_stride, params.mask_row_stride, bidb_cache)
-          + (bidh / params.h_h_mask_ratio) * params.mask_head_stride + m_block * kBlockM * params.mask_row_stride + (n_block_max - 1) * kBlockN
+        ? binfo.mask_offset(params.mask_batch_stride, params.mask_row_stride, bidb_cache, params.mask_layout_is_k_based)
+          + (bidh / params.h_h_mask_ratio) * params.mask_head_stride 
+          + (params.mask_layout_is_k_based ? 0 : m_block * kBlockM * params.mask_row_stride)  // No row offset for k-based
+          + (n_block_max - 1) * kBlockN
         : binfo.q_offset(/*batch_stride=*/index_t(0), params.mask_row_stride, bidb_cache)
-          + (bidh / params.h_h_mask_ratio) * params.mask_head_stride + m_block * kBlockM * params.mask_row_stride + block_table[block_table_idx] * params.mask_batch_stride + block_table_offset;
+          + (bidh / params.h_h_mask_ratio) * params.mask_head_stride 
+          + (params.mask_layout_is_k_based ? 0 : m_block * kBlockM * params.mask_row_stride)  // No row offset for k-based
+          + block_table[block_table_idx] * params.mask_batch_stride + block_table_offset;
     const index_t col_offset_bias = (block_table == nullptr)
-        ? binfo.bias_offset(params.bias_batch_stride, params.bias_row_stride, bidb_cache)
-          + (bidh / params.h_h_bias_ratio) * params.bias_head_stride + m_block * kBlockM * params.bias_row_stride + (n_block_max - 1) * kBlockN
+        ? binfo.bias_offset(params.bias_batch_stride, params.bias_row_stride, bidb_cache, params.bias_layout_is_k_based)
+          + (bidh / params.h_h_bias_ratio) * params.bias_head_stride 
+          + (params.bias_layout_is_k_based ? 0 : m_block * kBlockM * params.bias_row_stride)  // No row offset for k-based
+          + (n_block_max - 1) * kBlockN
         : binfo.q_offset(/*batch_stride=*/index_t(0), params.bias_row_stride, bidb_cache)
-          + (bidh / params.h_h_bias_ratio) * params.bias_head_stride + m_block * kBlockM * params.bias_row_stride + block_table[block_table_idx] * params.bias_batch_stride + block_table_offset;
+          + (bidh / params.h_h_bias_ratio) * params.bias_head_stride 
+          + (params.bias_layout_is_k_based ? 0 : m_block * kBlockM * params.bias_row_stride)  // No row offset for k-based
+          + block_table[block_table_idx] * params.bias_batch_stride + block_table_offset;
 
     // Global memory tensor configuration
     Tensor mQ = make_tensor(
@@ -962,12 +978,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gMask = make_tensor(
         make_gmem_ptr(reinterpret_cast<ElementMask *>(params.mask_ptr) + col_offset_mask),
         Shape<Int<kBlockM>, Int<kBlockN>>{},
-        make_stride(params.mask_row_stride, _1{})
+        params.mask_layout_is_k_based 
+            ? make_stride(_0{}, _1{})  // Broadcast across M (query) dimension for k-based layout
+            : make_stride(params.mask_row_stride, _1{})
     );
     Tensor gBias = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element *>(params.bias_ptr) + col_offset_bias),
         Shape<Int<kBlockM>, Int<kBlockN>>{},
-        make_stride(params.bias_row_stride, _1{})
+        params.bias_layout_is_k_based 
+            ? make_stride(_0{}, _1{})  // Broadcast across M (query) dimension for k-based layout
+            : make_stride(params.bias_row_stride, _1{})
     );
 
     // Shared memory layout configuration

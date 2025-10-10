@@ -52,6 +52,8 @@ void set_params_fprop(
     const float softcap,
     bool has_mask,
     bool has_bias,
+    bool mask_layout_is_k_based=false,
+    bool bias_layout_is_k_based=false,
     bool seqlenq_ngroups_swapped=false,
     const bool unpadded_lse=false
 ) {
@@ -142,6 +144,8 @@ void set_params_fprop(
     params.is_causal = is_causal;
     params.has_mask = has_mask;
     params.has_bias = has_bias;
+    params.mask_layout_is_k_based = mask_layout_is_k_based;
+    params.bias_layout_is_k_based = bias_layout_is_k_based;
     params.is_seqlens_k_cumulative = true;
 
     #ifdef FLASHATTENTION_DISABLE_UNEVEN_K
