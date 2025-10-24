@@ -17,7 +17,37 @@ from typing import Optional
 import torch
 
 
-def dynamic_mask(
+def topk_indices(
+    attention_bias: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    window_size: int,
+    min_dtype: float,
+):
+    r"""
+    This function computes the top-k indices based on the attention bias.
+
+    Args:
+        attention_bias (torch.Tensor): The attention bias tensor of shape
+            ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
+        attention_mask (Optional[torch.Tensor]): The attention mask boolean tensor of shape
+            ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
+        window_size (int): The number of top elements to consider for the mask.
+        min_dtype (float): The minimum value to use for masking.
+
+    Returns:
+        torch.Tensor: The top-k indices tensor of shape
+            ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, window_size).
+    """
+
+    attention_bias = attention_bias.masked_fill(~attention_mask, min_dtype) if attention_mask is not None else attention_bias
+    topk_indices = torch.topk(
+        attention_bias.detach(),
+        window_size, dim=-1, largest=True, sorted=False
+    ).indices
+    return topk_indices
+
+
+def topk_mask(
     attention_bias: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
     window_size: int,
@@ -33,11 +63,12 @@ def dynamic_mask(
             ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
         window_size (int): The number of top elements to consider for the mask.
         min_dtype (float): The minimum value to use for masking.
-    
+
     Returns:
         attention_mask (Tensor): The attention mask tensor of shape
             ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
     """
+
     attention_bias = attention_bias.masked_fill(~attention_mask, min_dtype) if attention_mask is not None else attention_bias
     topk_values, topk_indices = torch.topk(
         attention_bias.detach(),
@@ -47,6 +78,65 @@ def dynamic_mask(
         attention_bias, dtype=torch.bool, device=attention_bias.device
     ).scatter_(-1, topk_indices, topk_values != min_dtype)
     return attention_mask
+
+
+def create_indices(
+    attention_bias: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    batch_size: int,
+    query_len: int,
+    key_len: int,
+    window_size: int,
+    min_dtype: float,
+) -> torch.Tensor:
+    r"""
+    This function creates indices for Flash Dynamic Mask Attention.
+
+    If attention_mask is not of shape (batch_size, seq_len), it needs to match the shape of attention_bias.
+
+    Args:
+        attention_bias (torch.Tensor): The attention bias tensor of shape
+            ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
+        attention_mask (Optional[torch.Tensor]): The attention mask boolean tensor of shape
+            (batch_size, seq_len) or ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
+        batch_size (int): The batch size.
+        query_len (int): The sequence length of the query.
+        key_len (int): The sequence length of the key.
+        window_size (int): The number of top elements to consider for the attention mask.
+        min_dtype (float): The minimum value to use for masking.
+
+    Returns:
+        indices (Tensor): The attention indices tensor of shape
+            ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, window_size).
+    """
+
+    # If attention_mask is of shape (batch_size, seq_len), reshape it to (batch_size, 1, 1, key_len)
+    if attention_mask is not None and attention_mask.dim() == 2:
+        if attention_mask.shape[-1] == key_len:
+            attention_mask = attention_mask.view(batch_size, 1, 1, key_len)
+        elif attention_mask.shape[-1] == query_len:
+            pad_len = key_len - query_len
+            if pad_len > 0:
+                pad_mask = torch.ones(
+                    (batch_size, 1, 1, pad_len),
+                    dtype=torch.bool,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat(
+                    [pad_mask, attention_mask.view(batch_size, 1, 1, query_len)],
+                    dim=-1,
+                )
+            else:
+                attention_mask = attention_mask.view(batch_size, 1, 1, query_len)
+        else:
+            raise ValueError(
+                f"attention_mask shape {attention_mask.shape} is not compatible with key_len {key_len} or query_len {query_len}."
+            )
+
+    # Generate topk indices based on attention_bias and attention_mask
+    attention_indices = topk_indices(attention_bias, attention_mask, window_size, min_dtype)
+
+    return attention_indices
 
 
 def create_mask(
@@ -62,7 +152,7 @@ def create_mask(
     This function creates a mask tensor for Flash Dynamic Mask Attention.
 
     If attention_mask is not of shape (batch_size, seq_len), it needs to match the shape of attention_bias.
-    
+
     Args:
         attention_bias (torch.Tensor): The attention bias tensor of shape
             ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
@@ -101,8 +191,8 @@ def create_mask(
             raise ValueError(
                 f"attention_mask shape {attention_mask.shape} is not compatible with key_len {key_len} or query_len {query_len}."
             )
-    
-    # Generate dynamic mask based on attention_bias and attention_mask
-    attention_mask = dynamic_mask(attention_bias, attention_mask, window_size, min_dtype)
+
+    # Generate topk mask based on attention_bias and attention_mask
+    attention_mask = topk_mask(attention_bias, attention_mask, window_size, min_dtype)
 
     return attention_mask
