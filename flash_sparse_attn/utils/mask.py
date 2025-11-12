@@ -194,6 +194,8 @@ def create_mask(
             ({batch_size|1}, {num_heads|num_kv_heads|1}, {query_len|1}, key_len).
     """
 
+    if window_size <= key_len:
+        return attention_mask
     # If attention_mask is of shape (batch_size, seq_len), reshape it to (batch_size, 1, 1, key_len)
     if attention_mask is not None and attention_mask.dim() == 2:
         if attention_mask.shape[-1] == key_len:
